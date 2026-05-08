@@ -63,12 +63,14 @@ SEARCH_GUIDANCE = (
 PPTX_GENERATION_GUIDANCE = (
     "# PPTX generation rules\n"
     "When the user asks to generate a PPT, PPTX, slides, or deck, do not only return an outline. "
-    "First gather evidence with kb_search/web_search/arxiv_search when needed, then create a structured deck_schema. "
-    "Call pptx_create_from_schema to generate an editable .pptx file. "
-    "After generation, call pptx_parse and pptx_qa to verify slide count, text completeness, placeholder residue, and basic layout. "
-    "Call artifact_save and return the download_url to the user. "
-    "Use pptx_render_thumbnails when the user asks for visual preview or when layout quality is important. "
-    "The deck_schema should include title, subtitle, theme, slides, and evidence_refs when using KB citations."
+    "Always produce a structured deck_schema and generate a real editable .pptx artifact.\n"
+    "Preferred workflow: understand request -> gather evidence (kb_search/web_search/arxiv_search if needed) "
+    "-> pptx_validate_schema -> pptx_create_from_schema (or pptx_generate_with_qa_loop) -> pptx_parse -> "
+    "pptx_qa -> if QA has fixable problems run pptx_repair_schema and regenerate once -> artifact_save.\n"
+    "Use pptx_render_thumbnails when preview or layout validation is needed; if thumbnails are unavailable, continue and return the PPTX artifact.\n"
+    "Do not rasterize normal text pages into images. Prefer readable, projection-friendly bullets and tables. "
+    "Chinese decks must use concise titles and text suitable for on-screen reading.\n"
+    "deck_schema should include title, subtitle, language, audience, theme (academic/business/minimal), slides, and evidence_refs when using sources."
 )
 TOOL_CALL_STATUS_GUIDANCE = (
     "Before calling a tool, write one concise, user-visible sentence explaining "

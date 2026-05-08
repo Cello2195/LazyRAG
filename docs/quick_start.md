@@ -200,9 +200,21 @@ export PATH="$HOME/.local/bin:$PATH"
 ssh -o BatchMode=yes -o ConnectTimeout=6 mymac-via-tunnel 'docker --version'
 
 # 2) 同步代码到本机 Mac（容器实际在 Mac 上运行，必须有本地代码目录）
+#    注意：排除运行态目录，避免 rsync --delete 影响正在运行的 Redis/Postgres 等状态目录
 cd /home/mnt/xiongyida/project
-rsync -az --delete --exclude ".git" --exclude "__pycache__" --exclude "*.pyc" \
+rsync -az --delete \
+  --exclude ".git" \
+  --exclude "__pycache__" \
+  --exclude "*.pyc" \
+  --exclude "data/state/" \
+  --exclude "data/core/uploads/" \
+  --exclude "data/scan/" \
+  --exclude "data/watch/" \
   LazyRAG/ mymac-via-tunnel:/Users/xiongyida/project/LazyRAG/
+
+# 说明：
+# 1) 若出现 "data/core: not empty, cannot delete"，通常是因为目标目录仍有运行态文件，属可忽略告警。
+# 2) 同步排除了 .git，所以后续若看到 "fatal: not a git repository"（旧版 Makefile），不影响服务启动。
 ```
 
 ### 2. 生成 Mac 专用模型配置（服务器执行）
@@ -243,9 +255,72 @@ ssh mymac-via-tunnel '
   export PIP_DEFAULT_TIMEOUT=1200
   export PIP_RETRIES=30
   cd /Users/xiongyida/project/LazyRAG
+  test -f algorithm/chat/runtime_models.macproxy.yaml || \
+    (cp algorithm/chat/runtime_models.inner.yaml algorithm/chat/runtime_models.macproxy.yaml && \
+     sed -i "" "s|http://10.119.27.151:2269|http://host.docker.internal:2269|g" algorithm/chat/runtime_models.macproxy.yaml)
   make up-build
 '
 ```
+
+### 4.1 修改代码后如何生效（是否需要重启）
+
+原因是当前部署方式里，大部分服务代码打包在镜像内，改了仓库代码后，需要重新 build + recreate 容器才会生效。
+
+如果你改的是服务器上的代码，建议按下面顺序执行：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+
+# 1) 先把最新代码同步到本机 Mac
+cd /home/mnt/xiongyida/project
+rsync -az --delete \
+  --exclude ".git" \
+  --exclude "__pycache__" \
+  --exclude "*.pyc" \
+  --exclude "data/state/" \
+  --exclude "data/core/uploads/" \
+  --exclude "data/scan/" \
+  --exclude "data/watch/" \
+  LazyRAG/ mymac-via-tunnel:/Users/xiongyida/project/LazyRAG/
+
+# 2) 全量重建并重启（最稳妥）
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  export DOCKER_BUILDKIT=1
+  export LAZYRAG_OCR_SERVER_TYPE=none
+  export LAZYRAG_MODEL_CONFIG_PATH=/app/chat/runtime_models.macproxy.yaml
+  export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+  export PIP_DEFAULT_TIMEOUT=1200
+  export PIP_RETRIES=30
+  cd /Users/xiongyida/project/LazyRAG
+  test -f algorithm/chat/runtime_models.macproxy.yaml || \
+    (cp algorithm/chat/runtime_models.inner.yaml algorithm/chat/runtime_models.macproxy.yaml && \
+     sed -i "" "s|http://10.119.27.151:2269|http://host.docker.internal:2269|g" algorithm/chat/runtime_models.macproxy.yaml)
+  make up-build
+'
+```
+
+如果只改了某一个服务，可以只重建该服务（更快）：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  docker compose up -d --build chat
+'
+```
+
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  docker compose restart chat
+'
+
+
+常见服务名示例：`chat`、`evo-api`、`lazyllm-algo`、`frontend`、`core`、`auth-service`。
+改完后建议执行一次 `docker compose ps`，确认目标服务是 `Up (healthy)`。
 
 ### 5. 查看状态（服务器执行）
 
@@ -280,10 +355,21 @@ ssh mymac-via-tunnel 'export PATH=/Applications/Docker.app/Contents/Resources/bi
 export PATH="$HOME/.local/bin:$PATH"
 
 ssh mymac-via-tunnel '
-  echo -n "frontend "; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8090
-  echo -n "scan ";     curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18080/healthz
-  echo -n "evo ";      curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8048/healthz
-  echo -n "core ";     curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/api/core/health
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  check_url () {
+    name="$1"; url6="$2"; url4="$3"
+    code="$(curl -g -6 -s -o /dev/null -w "%{http_code}" --max-time 5 "$url6" || true)"
+    if [ -z "$code" ] || [ "$code" = "000" ]; then
+      code="$(curl -4 -s -o /dev/null -w "%{http_code}" --max-time 5 "$url4" || true)"
+    fi
+    echo "$name $code"
+  }
+  check_url "frontend" "http://[::1]:8090" "http://127.0.0.1:8090"
+  check_url "scan"     "http://[::1]:18080/healthz" "http://127.0.0.1:18080/healthz"
+  check_url "evo"      "http://[::1]:8048/healthz"  "http://127.0.0.1:8048/healthz"
+  check_url "core"     "http://[::1]:8001/api/core/health" "http://127.0.0.1:8001/api/core/health"
+  echo "redis";        docker compose ps redis
 '
 ```
 
@@ -292,4 +378,9 @@ ssh mymac-via-tunnel '
 - `ssh ... mymac-via-tunnel 'docker --version'` 不通：本地常驻隧道程序未运行或已断开。
 - `make up-build` 报 mount 路径错误：说明不是在 Mac 本地目录运行 compose，请确认代码已同步到 `/Users/xiongyida/project/LazyRAG`。
 - `lazyllm-algo` 启动失败且日志含 `10.119.27.151:2269 timeout`：检查第 3 步端口转发是否成功。
+- `lazyllm-algo` 报 `Model config ... runtime_models.macproxy.yaml not found`：按第 4/4.1 步中的 `test -f ... || cp ...` 兜底生成后重试。
+- `redis` 变成 `unhealthy` 且日志出现 `Failed opening the temp RDB file ... No such file or directory`：优先检查是否执行了会改动 `data/state/redis` 的同步/清理操作。
+- 网页弹 `服务器无响应` 但 `docker compose ps` 全是 `Up(healthy)`：优先检查 VSCode 本地端口转发是否占用了 `127.0.0.1:8090/8001`。  
+  现象：`lsof -nP -iTCP:8090 -sTCP:LISTEN` 里同时出现 `Code Helper (Plugin)` 与 `com.docker`。  
+  处理：优先访问 `http://[::1]:8090/agent/chat/home`，并在 VSCode Ports 面板关闭 `8090/8001` 的转发（或改成本地其它端口）。
 - 首轮 `make up-build` 拉镜像和大依赖耗时较长，常见 10~40 分钟。

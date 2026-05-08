@@ -1,53 +1,71 @@
-# LazyRAG PPTX Generation MVP
+# LazyRAG PPTX Generation (Phase 2)
 
-This patch adds the first PPTX artifact toolchain for Agentic LazyRAG. It follows a schema-driven workflow inspired by public PPTX generation skills and projects, but keeps the first renderer in Python to match the existing backend stack.
+This document describes the second-phase PPTX capability in LazyRAG. The pipeline keeps the Python stack (`python-pptx`) and extends phase 1 with stronger schema normalization, rule-based QA, and one-round auto-repair.
 
-## Added workflow
+## End-to-end flow
 
 ```text
-RAG evidence / user content
+user requirement / RAG evidence
   -> deck_schema
-  -> pptx_create_from_schema
+  -> pptx_validate_schema
+  -> pptx_create_from_schema (or pptx_generate_with_qa_loop)
   -> pptx_parse
   -> pptx_qa
+  -> (optional) pptx_repair_schema + regenerate once
   -> artifact_save
-  -> optional pptx_render_thumbnails
+  -> (optional) pptx_render_thumbnails
 ```
 
-## New tools
+## Core tools
 
-- `pptx_create_from_schema(deck_schema, filename)`: renders an editable `.pptx` from a normalized schema using `python-pptx`.
-- `pptx_parse(file_path)`: extracts slide count, text, table/image counts, and lightweight shape metadata.
-- `pptx_qa(file_path, deck_schema)`: checks empty slides, missing expected text, placeholder residue, excessive text, and simple bounds issues.
-- `pptx_render_thumbnails(file_path, dpi)`: converts PPTX to PDF via `LAZYRAG_OFFICE_CONVERT_URL` or local LibreOffice, then renders PNG thumbnails with PyMuPDF.
-- `artifact_save(file_path, kind, filename)`: copies generated files into LazyRAG's upload root and returns signed `/static-files/...` URLs.
+- `pptx_validate_schema(deck_schema)`
+- `pptx_create_from_schema(deck_schema, filename)`
+- `pptx_parse(file_path)`
+- `pptx_qa(file_path, deck_schema, thumbnail_result)`
+- `pptx_repair_schema(deck_schema, qa_result)`
+- `pptx_generate_with_qa_loop(deck_schema, filename, max_repair_rounds)`
+- `artifact_save(file_path, kind, filename, related_artifacts)`
+- `pptx_render_thumbnails(file_path, dpi)`
 
-## Supported slide types
+## Phase-2 enhancements
 
-The first Python renderer supports:
+1. **Schema robustness**
+- Normalization and validation for loose LLM outputs.
+- Auto-fallback for missing title/slides/type.
+- Type inference for `table`, `two_column`, `comparison`, `content_bullets`.
+- Theme fallback to `minimal`.
 
-- `cover`
-- `toc`
-- `section_divider`
-- `content_bullets`
-- `two_column`
-- `comparison`
-- `table`
-- `summary`
+2. **Theme system**
+- Built-in themes: `academic`, `business`, `minimal`.
+- Unified color/spacing/font tokens across slide renderers.
+- Chinese-friendly font fallback strategy.
 
-The schema normalizer is permissive and accepts common aliases such as `content`, `bullets`, `items`, `points`, `left_bullets`, `right_bullets`, `citations`, and `sources`.
+3. **Rendering quality controls**
+- Bullet count and length control.
+- Table row/column clipping to reduce overflow.
+- Notes and evidence/source propagation.
+- Optional references slide.
 
-## Important environment variables
+4. **Rule-based QA and repair**
+- File-level, slide-level, and shape-level checks.
+- Placeholder residue, empty slide, dense content, tiny fonts, out-of-bounds checks.
+- Optional thumbnail consistency checks.
+- Deterministic one-round auto-repair loop.
 
-- `LAZYRAG_UPLOAD_ROOT` or `LAZYRAG_SHARED_UPLOAD_DIR`: root for generated artifacts, default `/var/lib/lazyrag/uploads`.
-- `LAZYRAG_FILE_URL_SIGN_SECRET`: secret used to sign static file URLs, default matches the backend default.
-- `LAZYRAG_FILE_URL_EXPIRE_SECONDS`: signed URL expiry seconds, default `3600`.
-- `LAZYRAG_OFFICE_CONVERT_URL`: optional Office-to-PDF service URL, e.g. `http://office-convert-service:8080/v1/office/to-pdf`.
+5. **Artifact metadata**
+- `size_bytes`, `sha256`, `created_at` in saved artifact response.
+- Optional related artifact metadata (`pdf_path`, `thumbnail_paths`).
 
-## Next steps
+## Environment variables
 
-1. Add richer templates and chart rendering.
-2. Add OOXML/template editing for existing PPTX files.
-3. Add optional Node/PptxGenJS or HTML2PPTX renderer behind the same `deck_schema` interface.
-4. Add stronger visual QA from thumbnails, including low-contrast and overlap detection.
-5. Extend frontend chat responses with a first-class `artifacts` field instead of relying only on text links.
+- `LAZYRAG_UPLOAD_ROOT` / `LAZYRAG_SHARED_UPLOAD_DIR`
+- `LAZYRAG_FILE_URL_SIGN_SECRET`
+- `LAZYRAG_FILE_URL_EXPIRE_SECONDS`
+- `LAZYRAG_OFFICE_CONVERT_URL` (optional)
+- Local LibreOffice (`libreoffice` or `soffice`) is used when service URL is unavailable.
+
+## Current constraints
+
+- Node/PptxGenJS is not required in phase 2.
+- Thumbnail rendering depends on PDF conversion + PyMuPDF availability.
+- If thumbnail conversion fails, PPTX generation remains valid and returns the saved PPTX artifact.

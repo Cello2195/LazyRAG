@@ -28,10 +28,13 @@ DEFAULT_TOOLS = [
     'arxiv_search',
     'memory',
     'skill_manage',
+    'pptx_validate_schema',
     'pptx_create_from_schema',
+    'pptx_generate_with_qa_loop',
     'pptx_parse',
     'pptx_render_thumbnails',
     'pptx_qa',
+    'pptx_repair_schema',
     'artifact_save',
 ]
 

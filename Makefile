@@ -235,7 +235,8 @@ _COMPOSE_PROFILES := $(strip $(if $(_need_mineru),--profile mineru) $(if $(_need
 _COMPOSE_FILE_WATCHER_SCALE := $(if $(filter container,$(RAGSCAN_FILE_WATCHER_MODE)),,--scale file-watcher=0)
 
 # Only init submodules when not yet cloned; if already present (even with different commit), do nothing. Never recursive.
-_SUBMODULE_INIT = @git submodule status | grep -q '^-' && git submodule update --init || true
+# Guard non-git directories (for example rsync copies without .git) to avoid noisy fatal logs.
+_SUBMODULE_INIT = @git rev-parse --is-inside-work-tree >/dev/null 2>&1 && (git submodule status 2>/dev/null | grep -q '^-' && git submodule update --init || true) || true
 
 build:
 	$(_SUBMODULE_INIT)
