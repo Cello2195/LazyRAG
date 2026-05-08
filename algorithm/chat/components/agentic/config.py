@@ -10,6 +10,7 @@ from chat.prompts.agentic import (
     MEMORY_GUIDANCE,
     SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
+    PPTX_GENERATION_GUIDANCE,
     TOOL_CALL_STATUS_GUIDANCE,
     _COMBINED_REVIEW_PROMPT,
     _MEMORY_REVIEW_PROMPT,
@@ -27,6 +28,11 @@ DEFAULT_TOOLS = [
     'arxiv_search',
     'memory',
     'skill_manage',
+    'pptx_create_from_schema',
+    'pptx_parse',
+    'pptx_render_thumbnails',
+    'pptx_qa',
+    'artifact_save',
 ]
 
 BUILTIN_FILE_TOOLS = (
@@ -177,6 +183,8 @@ def _build_runtime_system_prompt(config: dict, available_tools: list[str]) -> st
         or 'url_fetch' in available_tools
     ):
         prompt_parts.append(SEARCH_GUIDANCE)
+    if 'pptx_create_from_schema' in available_tools:
+        prompt_parts.append(PPTX_GENERATION_GUIDANCE)
 
     return '\n\n'.join(prompt_parts)
 

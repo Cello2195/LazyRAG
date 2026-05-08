@@ -60,6 +60,16 @@ SEARCH_GUIDANCE = (
     "When answering with `web_search`, `url_fetch`, or `arxiv_search`, do not fabricate `[[n]]`; instead, "
     "mention the source title or URL plainly.\n"
 )
+PPTX_GENERATION_GUIDANCE = (
+    "# PPTX generation rules\n"
+    "When the user asks to generate a PPT, PPTX, slides, or deck, do not only return an outline. "
+    "First gather evidence with kb_search/web_search/arxiv_search when needed, then create a structured deck_schema. "
+    "Call pptx_create_from_schema to generate an editable .pptx file. "
+    "After generation, call pptx_parse and pptx_qa to verify slide count, text completeness, placeholder residue, and basic layout. "
+    "Call artifact_save and return the download_url to the user. "
+    "Use pptx_render_thumbnails when the user asks for visual preview or when layout quality is important. "
+    "The deck_schema should include title, subtitle, theme, slides, and evidence_refs when using KB citations."
+)
 TOOL_CALL_STATUS_GUIDANCE = (
     "Before calling a tool, write one concise, user-visible sentence explaining "
     "what you are about to do. Keep it action-oriented and do not reveal hidden "

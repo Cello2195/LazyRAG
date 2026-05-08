@@ -504,10 +504,6 @@ services:
       LAZYRAG_OPENSEARCH_URI: ${LAZYRAG_OPENSEARCH_URI:-https://opensearch:9200}
       LAZYRAG_OPENSEARCH_USER: ${LAZYRAG_OPENSEARCH_USER:-admin}
       LAZYRAG_OPENSEARCH_PASSWORD: ${LAZYRAG_OPENSEARCH_PASSWORD:-LazyRAG_OpenSearch123!}
-      LAZYRAG_MODEL_CONFIG_PATH: ${LAZYRAG_MODEL_CONFIG_PATH:-/app/chat/runtime_models.inner.yaml}
-      LAZYRAG_OCR_SERVER_TYPE: ${LAZYRAG_OCR_SERVER_TYPE:-mineru}
-      LAZYRAG_OCR_SERVER_URL: ${LAZYRAG_OCR_SERVER_URL:-http://host.docker.internal:20234}
-      LAZYRAG_MINERU_UPLOAD_MODE: ${LAZYRAG_MINERU_UPLOAD_MODE:-true}
       <<: *llm-api-keys
     command: ["python", "-m", "parsing.parsing"]
     depends_on:
@@ -546,7 +542,7 @@ services:
       retries: 5
       start_period: 30s
     environment:
-      LAZYRAG_MODEL_CONFIG_PATH: ${LAZYRAG_MODEL_CONFIG_PATH:-chat/runtime_models.inner.yaml}
+      LAZYRAG_MODEL_CONFIG_PATH: ${LAZYRAG_MODEL_CONFIG_PATH:-/app/chat/runtime_models.inner.yaml}
       LAZYRAG_DOCUMENT_SERVER_URL: ${LAZYRAG_DOCUMENT_SERVER_URL:-http://parsing:8000,general_algo}
       LAZYRAG_SHARED_UPLOAD_DIR: ${LAZYRAG_SHARED_UPLOAD_DIR:-/var/lib/lazyrag/uploads}
       LAZYLLM_MOUNT_DIR: ${LAZYRAG_SHARED_UPLOAD_DIR:-/var/lib/lazyrag/uploads}
@@ -560,7 +556,6 @@ services:
       LAZYRAG_MEMORY_REVIEW_INTERVAL: ${LAZYRAG_MEMORY_REVIEW_INTERVAL:-1}
       LAZYRAG_SKILL_REVIEW_INTERVAL: ${LAZYRAG_SKILL_REVIEW_INTERVAL:-5}
       LAZYRAG_SKILL_REVIEW_DEBUG: ${LAZYRAG_SKILL_REVIEW_DEBUG:-false}
-      LAZYRAG_MODEL_CONFIG_PATH: ${LAZYRAG_MODEL_CONFIG_PATH:-/app/chat/runtime_models.inner.yaml}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-}
       LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}

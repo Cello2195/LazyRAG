@@ -6,9 +6,13 @@ ARG APT_MIRROR=http://mirrors.aliyun.com/debian
 ARG APT_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 ARG LAZYLLM_GITHUB_REF=main
 ARG LAZYLLM_ARCHIVE_BASE=https://codeload.github.com/LazyAGI/LazyLLM/tar.gz/refs/heads
-ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
-ARG PIP_DEFAULT_TIMEOUT=300
-ARG PIP_RETRIES=10
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_DEFAULT_TIMEOUT=1200
+ARG PIP_RETRIES=30
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT} \
+    PIP_RETRIES=${PIP_RETRIES}
 
 RUN --mount=type=secret,id=apt_http_proxy,required=false \
     --mount=type=secret,id=apt_https_proxy,required=false \
@@ -89,7 +93,7 @@ LABEL org.opencontainers.image.revision="${LAZYRAG_GIT_SHA}"
 LABEL io.lazyrag.lazyrag_git_sha="${LAZYRAG_GIT_SHA}"
 LABEL io.lazyrag.lazyllm_git_sha="${LAZYLLM_GIT_SHA}"
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --retries "${PIP_RETRIES}" --timeout "${PIP_DEFAULT_TIMEOUT}" -r requirements.txt
 COPY . .
 RUN chmod +x /app/docker-entrypoint.sh
 ENV PYTHONPATH=/opt/lazyllm:/app
@@ -128,7 +132,7 @@ ARG MINERU_NUMPY_VERSION=1.26.4
 ARG MINERU_PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ARG MINERU_PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --retries "${PIP_RETRIES}" --timeout "${PIP_DEFAULT_TIMEOUT}" -r requirements.txt
 RUN if [ "$MINERU_PREINSTALL_CPU_TORCH" = "1" ]; then \
         pip install --no-cache-dir \
         --index-url "$MINERU_PYTORCH_INDEX_URL" \
