@@ -45,6 +45,26 @@ DEFAULT_TOOLS = [
     'artifact_save',
 ]
 
+DEFAULT_PPTX_SKILLS = (
+    'visual-pptx-generation',
+    'pptx-generation',
+)
+_PPTX_INTENT_KEYWORDS = (
+    'ppt',
+    'pptx',
+    'powerpoint',
+    'slides',
+    'deck',
+    '幻灯片',
+    '演示文稿',
+    '汇报',
+    '报告',
+    'minimax',
+    'guizang',
+    '视觉化ppt',
+    '科技感ppt',
+)
+
 BUILTIN_FILE_TOOLS = (
     'read_file',
     'list_dir',
@@ -110,6 +130,42 @@ def _normalize_available_skills(skills: Any) -> list[str]:
     if not isinstance(skills, list):
         return []
     return [skill for skill in skills if isinstance(skill, str) and skill]
+
+
+def _contains_pptx_intent(query: str) -> bool:
+    text = str(query or '').strip().lower()
+    if not text:
+        return False
+    return any(keyword in text for keyword in _PPTX_INTENT_KEYWORDS)
+
+
+def _augment_skills_for_request(
+    available_skills: list[str],
+    *,
+    query: str,
+    available_tools: list[str],
+) -> list[str]:
+    if not isinstance(available_skills, list):
+        available_skills = []
+
+    needs_pptx_skill = _contains_pptx_intent(query) and (
+        'html_deck_generate_visual_pptx' in available_tools
+        or 'pptx_create_from_schema' in available_tools
+    )
+    if not needs_pptx_skill:
+        return available_skills
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for skill in available_skills:
+        if isinstance(skill, str) and skill and skill not in seen:
+            seen.add(skill)
+            merged.append(skill)
+    for skill in DEFAULT_PPTX_SKILLS:
+        if skill not in seen:
+            seen.add(skill)
+            merged.append(skill)
+    return merged
 
 
 def _env_int(name: str, default: int) -> int:

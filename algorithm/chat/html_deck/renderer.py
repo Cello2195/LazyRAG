@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 from .artifact import artifact_dir, save_artifact, static_file_url
-from .schema import normalize_visual_deck_schema
+from .schema import normalize_visual_deck_schema, parse_deck_schema_input
 
 """Guizang-style visual renderer for the HTML deck route.
 
@@ -713,17 +713,20 @@ def create_html_deck_from_schema(
     deck_name: str = 'visual_deck',
     persist_index: bool = True,
 ) -> Dict[str, Any]:
-    if theme is None:
-        schema_input = deck_schema
-    elif isinstance(deck_schema, Mapping):
-        schema_input = dict(deck_schema)
-        schema_input['visual_theme'] = theme
-    else:
-        schema_input = {
-            'title': 'Visual Deck',
-            'slides': [{'type': 'content_bullets', 'title': 'Content', 'bullets': [str(deck_schema or '')]}],
-            'visual_theme': theme,
+    try:
+        schema_input = parse_deck_schema_input(deck_schema)
+    except ValueError as exc:
+        return {
+            'success': False,
+            'error_code': 'schema_parse_failed',
+            'error_message': str(exc),
+            'warnings': ['deck_schema must be a structured object with slides list'],
+            'slide_paths': [],
+            'slide_count': 0,
         }
+    if theme is not None:
+        schema_input = dict(schema_input)
+        schema_input['visual_theme'] = theme
     deck = normalize_visual_deck_schema(schema_input)
 
     base_dir = Path(output_dir).expanduser().resolve() if output_dir else artifact_dir('html-deck-work') / _safe_name(deck_name)

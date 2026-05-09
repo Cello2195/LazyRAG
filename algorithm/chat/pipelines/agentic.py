@@ -20,6 +20,7 @@ from lazyllm.tools.sandbox.sandbox_base import create_sandbox  # noqa: F401
 
 
 from chat.components.agentic.config import (  # noqa: E402
+    _augment_skills_for_request,
     _build_runtime_system_prompt,
     _env_int,
     _filter_tools_for_request,
@@ -174,6 +175,11 @@ def agentic_forward(
         config,
     )
     available_skills = _normalize_available_skills(config.get('available_skills'))
+    available_skills = _augment_skills_for_request(
+        available_skills,
+        query=query,
+        available_tools=available_tools,
+    )
     skills_dir = config.get('skill_fs_url') or ''
     config['available_tools'] = available_tools
     config['available_skills'] = available_skills

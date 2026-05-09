@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - local debug fallback.
 from chat.html_deck.export_pptx import create_pptx_from_slide_images
 from chat.html_deck.qa import run_html_deck_qa
 from chat.html_deck.renderer import create_html_deck_from_schema
-from chat.html_deck.schema import validate_html_deck_schema
+from chat.html_deck.schema import parse_deck_schema_input, validate_html_deck_schema
 from chat.html_deck.screenshot import render_html_deck_screenshots
 from chat.html_deck.artifact import artifact_dir, save_artifact, save_html_deck_bundle, static_file_url
 
@@ -55,6 +55,24 @@ def _resolve_index(index_path: Optional[str], deck_dir: Optional[str]) -> Path:
     raise ValueError('index_path or deck_dir is required')
 
 
+def _parse_schema_or_failure(deck_schema: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    try:
+        parsed = parse_deck_schema_input(deck_schema)
+        return parsed, None
+    except Exception as exc:
+        return None, {
+            'success': False,
+            'error_code': 'schema_parse_failed',
+            'reason': f'invalid deck_schema: {exc}',
+            'error': str(exc),
+            'hints': [
+                'deck_schema must be a JSON object',
+                'deck_schema.slides must be a list',
+                'remove markdown code fence before passing JSON',
+            ],
+        }
+
+
 @fc_register('tool', execute_in_sandbox=False)
 @_handle_tool_errors
 def html_deck_validate_schema(deck_schema: Any, theme: Optional[Any] = None) -> Dict[str, Any]:
@@ -64,7 +82,10 @@ def html_deck_validate_schema(deck_schema: Any, theme: Optional[Any] = None) -> 
         deck_schema: Structured deck schema.
         theme: Optional visual theme name or dict, e.g. auto, cyber_blue, academic_light, corporate_blue, or a custom palette dict.
     """
-    return validate_html_deck_schema(deck_schema, theme=theme)
+    parsed, failure = _parse_schema_or_failure(deck_schema)
+    if failure:
+        return failure
+    return validate_html_deck_schema(parsed, theme=theme)
 
 
 @fc_register('tool', execute_in_sandbox=False)
@@ -73,6 +94,7 @@ def html_deck_create_from_schema(
     deck_schema: Any,
     deck_name: str = 'visual_deck',
     theme: Optional[Any] = None,
+    output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create theme-aware fixed-size HTML slides from deck_schema.
 
@@ -83,8 +105,17 @@ def html_deck_create_from_schema(
         deck_schema: Structured deck schema for visual deck rendering.
         deck_name: Output deck folder/artifact stem.
         theme: Optional visual theme name or palette override.
+        output_dir: Optional explicit output directory.
     """
-    return create_html_deck_from_schema(deck_schema, theme=theme, deck_name=_safe_stem(deck_name))
+    parsed, failure = _parse_schema_or_failure(deck_schema)
+    if failure:
+        return failure
+    return create_html_deck_from_schema(
+        parsed,
+        theme=theme,
+        deck_name=_safe_stem(deck_name),
+        output_dir=output_dir,
+    )
 
 
 @fc_register('tool', execute_in_sandbox=False)
@@ -203,6 +234,8 @@ def html_deck_generate_visual_pptx(
     filename: str = 'visual_deck.pptx',
     theme: Optional[Any] = None,
     render_screenshots: bool = True,
+    output_dir: Optional[str] = None,
+    require_screenshots: bool = False,
 ) -> Dict[str, Any]:
     """Generate a theme-aware visual deck and optional image-based PPTX.
 
@@ -217,9 +250,38 @@ def html_deck_generate_visual_pptx(
         filename: Output visual PPTX filename.
         theme: Optional visual theme name or palette override.
         render_screenshots: Whether to run screenshot and PPTX export steps.
+        output_dir: Optional explicit output directory for generated artifacts.
+        require_screenshots: If true, fail when real browser screenshots are unavailable.
     """
+    parsed, failure = _parse_schema_or_failure(deck_schema)
+    if failure:
+        return failure
+
+    validation_result = validate_html_deck_schema(parsed, theme=theme)
+    if not validation_result.get('success'):
+        return {
+            'success': False,
+            'error_code': 'schema_validation_failed',
+            'reason': 'deck_schema validation failed',
+            'validation': validation_result,
+        }
+
+    if validation_result.get('issues'):
+        return {
+            'success': False,
+            'error_code': 'schema_validation_failed',
+            'reason': 'deck_schema has validation issues',
+            'validation': validation_result,
+        }
+
+    normalized_schema = validation_result.get('normalized_schema') or parsed
     stem = _safe_stem(filename, 'visual_deck')
-    html_result = create_html_deck_from_schema(deck_schema, theme=theme, deck_name=stem)
+    html_result = create_html_deck_from_schema(
+        normalized_schema,
+        theme=theme,
+        deck_name=stem,
+        output_dir=output_dir,
+    )
     if not html_result.get('success'):
         return html_result
 
@@ -233,6 +295,7 @@ def html_deck_generate_visual_pptx(
     saved_pptx: Dict[str, Any] = {}
     bundle_result: Dict[str, Any] = {}
 
+    render_screenshots = bool(render_screenshots or require_screenshots)
     if render_screenshots:
         screenshot_result = render_html_deck_screenshots(
             deck_dir=html_result.get('deck_dir'),
@@ -296,8 +359,22 @@ def html_deck_generate_visual_pptx(
     if render_screenshots and not can_export_visual:
         warnings.append('visual PPTX export requires real Playwright/Chromium screenshots; fallback previews are not exportable.')
 
+    if require_screenshots and not can_export_visual:
+        return {
+            'success': False,
+            'error_code': 'visual_export_not_ready',
+            'reason': 'require_screenshots=true but real browser screenshots are unavailable',
+            'html_deck': html_result,
+            'preview': preview_result,
+            'html_qa': qa_result,
+            'screenshot_result': screenshot_result,
+            'can_export_visual_pptx': False,
+            'warnings': warnings,
+        }
+
     return {
         'success': True,
+        'schema_validation': validation_result,
         'html_deck': html_result,
         'preview': preview_result,
         'html_qa': qa_result,

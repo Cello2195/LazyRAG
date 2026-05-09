@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Mapping
 
@@ -132,6 +134,80 @@ _TYPE_ALIASES = {
     'references': 'references',
 }
 
+_MARKDOWN_FENCE_RE = re.compile(
+    r'^\s*```(?:json|javascript|js)?\s*(.*?)\s*```\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    value = str(text or '').strip()
+    if not value:
+        return value
+    match = _MARKDOWN_FENCE_RE.match(value)
+    if match:
+        return match.group(1).strip()
+    return value
+
+
+def parse_deck_schema_input(value: Any, *, max_decode_depth: int = 3) -> Dict[str, Any]:
+    """Parse deck_schema input from dict / JSON string / fenced / double-encoded JSON.
+
+    Args:
+        value: Raw deck schema input.
+        max_decode_depth: Maximum json.loads depth for nested encoded strings.
+
+    Returns:
+        Parsed deck schema dict.
+
+    Raises:
+        ValueError: If parsing fails or payload is structurally invalid.
+    """
+    if isinstance(value, Mapping):
+        parsed: Dict[str, Any] = deepcopy(dict(value))
+    else:
+        current: Any = value
+        if isinstance(current, (bytes, bytearray)):
+            current = current.decode('utf-8', errors='ignore')
+
+        parsed = {}
+        for depth in range(max(1, int(max_decode_depth))):
+            if isinstance(current, Mapping):
+                parsed = deepcopy(dict(current))
+                break
+            if not isinstance(current, str):
+                raise ValueError(
+                    f'deck_schema must be a dict or JSON string, got {type(current).__name__}'
+                )
+
+            text = _strip_markdown_code_fence(current)
+            if not text:
+                raise ValueError('deck_schema is empty')
+
+            try:
+                current = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f'deck_schema JSON parse failed: {exc}') from exc
+
+            if isinstance(current, Mapping):
+                parsed = deepcopy(dict(current))
+                break
+            if isinstance(current, str) and depth + 1 < max_decode_depth:
+                continue
+            raise ValueError(
+                f'deck_schema JSON must decode to an object, got {type(current).__name__}'
+            )
+
+        if not parsed:
+            raise ValueError('deck_schema parse failed: empty object')
+
+    if 'slides' in parsed and not isinstance(parsed.get('slides'), list):
+        raise ValueError('deck_schema.slides must be a list')
+    if 'slides' not in parsed:
+        parsed['slides'] = []
+
+    return parsed
+
 
 def _as_list(value: Any) -> List[str]:
     if value is None:
@@ -236,9 +312,16 @@ def resolve_visual_theme(deck_schema: Mapping[str, Any]) -> Dict[str, Any]:
     return resolve_html_theme(theme_input, deck_schema=deck_schema)
 
 
-def normalize_visual_deck_schema(deck_schema: Any) -> Dict[str, Any]:
-    raw_input = deck_schema if isinstance(deck_schema, Mapping) else {}
-    base = normalize_deck_schema(deck_schema)
+def normalize_visual_deck_schema(deck_schema: Any, theme: Any = None) -> Dict[str, Any]:
+    try:
+        parsed_input = parse_deck_schema_input(deck_schema)
+    except ValueError:
+        parsed_input = deck_schema if isinstance(deck_schema, Mapping) else {}
+
+    raw_input = dict(parsed_input) if isinstance(parsed_input, Mapping) else {}
+    if theme not in (None, ''):
+        raw_input['visual_theme'] = theme
+    base = normalize_deck_schema(parsed_input if parsed_input else deck_schema)
     normalized: Dict[str, Any] = deepcopy(base if isinstance(base, dict) else {})
 
     # Preserve visual-route top-level fields that may be dropped by editable-pptx normalizer.
@@ -381,9 +464,29 @@ def normalize_visual_deck_schema(deck_schema: Any) -> Dict[str, Any]:
     return normalized
 
 
-def validate_visual_deck_schema(deck_schema: Any) -> Dict[str, Any]:
-    base = validate_deck_schema(deck_schema)
-    normalized = normalize_visual_deck_schema(base.get('normalized_schema') if isinstance(base, dict) else deck_schema)
+def validate_visual_deck_schema(deck_schema: Any, theme: Any = None) -> Dict[str, Any]:
+    try:
+        parsed_input = parse_deck_schema_input(deck_schema)
+    except ValueError as exc:
+        return {
+            'success': False,
+            'valid': False,
+            'issues': [
+                {
+                    'level': 'error',
+                    'code': 'schema_parse_failed',
+                    'message': str(exc),
+                }
+            ],
+            'warnings': [],
+            'normalized_schema': {},
+        }
+
+    base = validate_deck_schema(parsed_input)
+    normalized = normalize_visual_deck_schema(
+        base.get('normalized_schema') if isinstance(base, dict) else parsed_input,
+        theme=theme,
+    )
 
     issues: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = list(base.get('warnings') or []) if isinstance(base, dict) else []

@@ -1,61 +1,405 @@
 ---
 name: visual-pptx-generation
-category: presentation
-summary: Generate theme-aware high-visual HTML decks and image-based PPTX artifacts.
+description: Generate editable or visual PPTX files from user requests. Use this skill when the user asks to create, generate, export, design, or improve a PowerPoint/PPT/PPTX/deck/slides presentation.
 ---
 
 # Visual PPTX Generation Skill
 
-Use this skill when the user asks for a polished, MiniMax-like, magazine-style, demo/pitch-style, strongly visual, or non-white-background presentation. This route prioritizes visual quality over native text editability.
+This skill controls how LazyRAG converts a user request into a real PPTX artifact.
 
-## Route selection
+The goal is not to return a slide outline as text. The goal is to generate a real downloadable file through the available PPTX / HTML-deck tools.
 
-- Use `editable_pptx` when the user needs an editable office document, formal academic slides, or text/table-heavy deliverables.
-- Use `visual_pptx` when the user explicitly wants strong visual impact, MiniMax-like effects, rich layout, product/demo/pitch style, or says the current PPT looks too plain.
-- Tell the user that `visual_pptx` is usually image-based after screenshot export, so the final PPTX is visually faithful but not fully text-editable.
+## 1. When to use this skill
 
-## Theme policy
+Use this skill when the user asks for any of the following:
 
-Do **not** force every visual deck into one dark-tech palette, and also do **not** create a bag of unrelated visual styles. The default design system is a single Guizang-style family: editorial framing, large numbering, strong cards, SVG ornaments, and magazine-like page rhythm. Prefer `visual_theme="auto"` unless the user gives a specific style. The renderer supports coherent variants:
+- 生成 PPT / PPTX / PowerPoint / slides / deck
+- 做一个汇报 / 演示文稿 / 讲座幻灯片
+- 生成更好看的 PPT
+- 生成类似 MiniMax / guizang / 科技感 / 发布会风 / 视觉化 的 PPT
+- 把资料、论文、报告、检索结果整理成 PPT
+- 输出可下载的 PPTX 文件
 
-- `guizang_ink`: electronic-ink / dark editorial keynote.
-- `guizang_aurora`: AI / Agent / infrastructure / demo decks.
-- `guizang_paper`: research, lecture, viewpoint, warm editorial decks.
-- `guizang_blueprint`: project, architecture, business-technical plans.
-- `guizang_business`: polished product / strategy / executive decks.
-- `guizang_noir`: premium launch / final keynote decks.
+Do not only provide a textual outline unless the user explicitly asks only for an outline.
 
-Backward-compatible names such as `cyber_blue`, `dark_tech`, `corporate_blue`, `academic_light`, `warm_editorial`, `emerald_dark`, `violet_neon`, `midnight_gold`, and `light_magazine` are accepted, but they should resolve to this unified visual family instead of becoming unrelated templates. If the user provides colors, pass a custom palette, for example:
+## 2. Decide the generation route
 
-```json
-{"base":"corporate_blue", "palette":{"primary":"#7c3aed", "background":"#faf5ff", "surface":"#ffffff"}}
+There are two PPTX routes.
+
+### 2.1 editable_pptx route
+
+Use this route when the user emphasizes:
+
+- 可编辑
+- 正式办公交付
+- 后续还要手动修改
+- 论文组会
+- 技术报告
+- 表格和文字准确性优先
+- 不强调强视觉效果
+
+Tool route:
+
+```text
+deck_schema
+→ pptx_create_from_schema
+→ pptx_parse
+→ pptx_qa
+→ artifact_save
 ```
 
-## Workflow
+### 2.2 visual_pptx route
 
-1. Gather evidence with `kb_search`, `web_search`, `url_fetch`, or `arxiv_search` if the deck needs factual content.
-2. Create a concise `deck_schema`. Include `title`, `subtitle`, `language`, `audience`, optional `visual_theme` or custom palette, and `slides`.
-3. Plan the visual rhythm before rendering: `cover -> toc -> section_divider -> metric_poster -> challenge/card_grid -> editorial_content -> comparison/table -> quote/process -> summary/references`. Avoid repeating the same title+rule+card layout across pages.
-4. Call `html_deck_validate_schema` and then `html_deck_create_from_schema`.
-5. Call `html_deck_preview` to return preview path/URL, then call `html_deck_qa`.
-6. Render screenshots + export PPTX with `html_deck_render_screenshots` and `pptx_create_from_html_screenshots`, or use `html_deck_generate_visual_pptx` for one-shot flow.
-7. If screenshot export is unavailable, return the HTML deck and explain that Playwright/browser runtime is needed for image-based PPTX export.
-8. If an image-based PPTX is created, return signed download URL fields first (`download_link`, then `download_url`/`file_url`) and mention that it is image-based.
-9. Do not present `relative_path` or local `file_path` as a web download URL.
+Use this route when the user emphasizes:
 
-## Schema tips
+- 好看
+- 视觉化
+- 科技感
+- MiniMax 风格
+- guizang 风格
+- 发布会风
+- 演讲展示
+- demo
+- 产品介绍
+- 不强要求每个元素可编辑
 
-- Use `metrics` for big-number pages, e.g. `{label, value, desc}`.
-- Use `cards` or `bullets` for visual cards pages, with 3-4 concise points.
-- Use `columns`, `left/right`, or `headers/rows` for comparison/table pages.
-- Add `evidence_refs` to preserve source traceability.
-- Keep each slide visually sparse: short title, few bullets, one dominant visual pattern.
-- Avoid repeating exactly the same layout and color mood for too many consecutive slides. Different themes must change composition tokens, not only colors.
+Tool route:
 
-## Do not
+```text
+deck_schema
+→ html_deck_generate_visual_pptx
+```
 
-- Do not use this route for users who require fully editable text and shapes.
-- Do not output only a slide outline.
-- Do not depend on text-to-image models as a required step.
-- Do not invent missing citations or sources.
-- Do not hard-code the same palette for every deck when the user asks for flexible style.
+Prefer the one-shot tool `html_deck_generate_visual_pptx` when available. It should internally handle:
+
+```text
+normalize schema
+→ validate schema
+→ create HTML deck
+→ QA
+→ Playwright screenshots
+→ image-based PPTX
+→ artifact save
+```
+
+If the one-shot tool is unavailable, use the lower-level tools in this order:
+
+```text
+html_deck_create_from_schema
+→ html_deck_qa
+→ html_deck_render_screenshots
+→ pptx_create_from_html_screenshots
+→ artifact_save
+```
+
+## 3. Important output rule
+
+The final answer must not be a raw JSON schema, raw HTML code, or only a slide outline.
+
+The final answer should summarize:
+
+```text
+已生成 PPTX
+- 文件名
+- 页数
+- 下载链接或文件路径
+- HTML 预览链接或路径，if available
+- QA 状态
+- 如果失败，说明失败原因和下一步处理方式
+```
+
+If the tool returns a valid `download_url`, preserve it exactly. Do not rewrite, reconstruct, or modify download URLs.
+
+## 4. Protect download link logic
+
+Do not change or bypass the existing web download link logic.
+
+When a tool returns fields such as:
+
+```json
+{
+  "download_url": "...",
+  "preview_url": "...",
+  "file_path": "...",
+  "artifact": {...},
+  "artifacts": {...}
+}
+```
+
+Use them as returned.
+
+Do not invent a new URL.
+Do not manually concatenate static file paths.
+Do not modify backend static-file or signed-url logic.
+Do not change frontend download button behavior.
+Do not alter existing artifact_save implementation unless the user explicitly asks to fix download-link logic.
+
+The current web download implementation is fragile and must be protected.
+
+## 5. Required deck_schema structure
+
+Always build a structured `deck_schema` before calling PPTX tools.
+
+A valid deck schema should look like:
+
+```json
+{
+  "title": "AI时代下的程序员该何去何从",
+  "subtitle": "职业生存指南与进阶策略",
+  "language": "zh",
+  "audience": "technical",
+  "style": "auto",
+  "visual_theme": "auto",
+  "slides": [
+    {
+      "type": "cover",
+      "title": "AI时代下的程序员该何去何从",
+      "subtitle": "职业生存指南与进阶策略"
+    },
+    {
+      "type": "toc",
+      "title": "目录",
+      "items": [
+        "AI浪潮来袭",
+        "直面冲击",
+        "新的机会",
+        "能力重塑",
+        "行动建议"
+      ]
+    },
+    {
+      "type": "section_divider",
+      "title": "01 AI浪潮来袭",
+      "subtitle": "行业现状分析"
+    },
+    {
+      "type": "metric_cards",
+      "title": "AI正在改变软件开发分工",
+      "metrics": [
+        {
+          "label": "编码效率提升",
+          "value": "55%",
+          "description": "AI 编程工具提升基础编码速度"
+        },
+        {
+          "label": "工具采用率",
+          "value": "84%",
+          "description": "开发者已使用或计划使用 AI 工具"
+        },
+        {
+          "label": "岗位结构变化",
+          "value": "30%",
+          "description": "初级岗位需求承压"
+        }
+      ],
+      "bullets": [
+        "变化不是简单淘汰，而是开发范式重组"
+      ]
+    },
+    {
+      "type": "challenge_cards",
+      "title": "程序员面临的主要挑战",
+      "cards": [
+        {
+          "title": "岗位替代风险",
+          "body": "重复性编码和简单 CRUD 工作更容易被自动化工具压缩。",
+          "accent": "danger"
+        },
+        {
+          "title": "效率基准提升",
+          "body": "团队对交付速度和工具使用能力的要求明显提高。",
+          "accent": "primary"
+        },
+        {
+          "title": "技能更新压力",
+          "body": "开发者需要从代码实现者转向问题定义者和系统设计者。",
+          "accent": "secondary"
+        },
+        {
+          "title": "竞争结构变化",
+          "body": "掌握 AI 工具的人才会获得更高生产力杠杆。",
+          "accent": "success"
+        }
+      ]
+    },
+    {
+      "type": "summary",
+      "title": "总结",
+      "bullets": [
+        "AI 不会简单淘汰所有程序员，但会重塑岗位结构。",
+        "基础编码能力仍重要，但不再是唯一护城河。",
+        "未来竞争力来自系统设计、业务理解、AI 协作和持续学习。"
+      ]
+    }
+  ]
+}
+```
+
+## 6. Slide type policy
+
+Choose slide types according to content:
+
+| Content need | Preferred slide type |
+|---|---|
+| Title page | `cover` |
+| Agenda | `toc` |
+| New chapter | `section_divider` |
+| Important statistics | `metric_cards` |
+| Risks / challenges / opportunities | `challenge_cards` |
+| Normal explanation | `content_bullets` |
+| Two perspectives | `two_column` |
+| Comparison | `comparison` |
+| Data table | `table` |
+| Process / roadmap | `process` or `timeline` |
+| Quote / key idea | `quote` |
+| Final conclusion | `summary` |
+| Sources | `references` |
+
+Avoid putting too much content on one slide.
+
+Recommended content limits:
+
+```text
+cover: title + subtitle only
+toc: 4–7 items
+metric_cards: 2–4 metrics
+challenge_cards: 3–6 cards
+content_bullets: 3–6 bullets
+table: max 5 rows × 4 columns when possible
+summary: 3–5 takeaways
+```
+
+## 7. Theme policy
+
+Do not hard-code one fixed theme.
+
+If the user gives no preference, use:
+
+```json
+"visual_theme": "auto"
+```
+
+If the user requests a style, choose accordingly:
+
+| User intent | Suggested theme |
+|---|---|
+| AI / Agent / system / engineering | `guizang_aurora` or `guizang_ink` |
+| Business / product / project report | `guizang_business` or `guizang_blueprint` |
+| Academic / paper / group meeting | `guizang_paper` or `guizang_blueprint` |
+| High-end strategy / annual summary | `guizang_noir` |
+| Editorial / course / public talk | `guizang_paper` |
+
+If the user provides brand colors or preferred colors, pass them as `palette`.
+
+Example:
+
+```json
+{
+  "visual_theme": "auto",
+  "palette": {
+    "primary": "#7c3aed",
+    "accent": "#f97316"
+  }
+}
+```
+
+## 8. Evidence and citations
+
+If the PPT is based on retrieved documents, web pages, papers, or KB evidence:
+
+- preserve important source information in `evidence_refs`;
+- add a `references` slide when sources are numerous;
+- do not invent data;
+- do not fabricate statistics;
+- if evidence is insufficient, state the limitation.
+
+Example:
+
+```json
+{
+  "type": "references",
+  "title": "参考资料",
+  "sources": [
+    "Source 1: ...",
+    "Source 2: ..."
+  ]
+}
+```
+
+## 9. Failure handling
+
+If a tool fails, do not repeatedly call tools without changing the input.
+
+Use this policy:
+
+### 9.1 Schema parse failure
+
+If the tool reports schema parsing failure:
+
+1. Rebuild a clean `deck_schema`.
+2. Ensure `slides` is a list, not a JSON string.
+3. Retry once.
+
+If it still fails, stop and return a concise error.
+
+### 9.2 Screenshot / visual export failure
+
+If the visual route fails because Playwright, Chromium, or fonts are missing:
+
+- do not claim PPTX generation succeeded;
+- return the HTML deck path if available;
+- explain that real browser screenshot export is not ready;
+- include the install hint returned by the tool.
+
+Do not use fallback screenshots as a final visual PPTX.
+
+### 9.3 Download link missing
+
+If the tool produced a file path but no download URL:
+
+- return the file path;
+- do not invent a download URL;
+- do not modify web download logic.
+
+## 10. Final response format
+
+When successful:
+
+```text
+已生成 PPTX。
+
+文件：<filename>
+页数：<slide_count>
+下载：<download_url or file_path>
+预览：<preview_url or index_path>
+QA：<passed / warnings>
+
+说明：visual_pptx 为图片型 PPTX，视觉效果优先，不保证每个元素可编辑。
+```
+
+When failed:
+
+```text
+PPTX 暂未成功生成。
+
+已完成：
+- HTML deck: <path if available>
+- QA: <status>
+
+失败原因：
+- <error_message>
+
+建议：
+- <install_hint or next step>
+```
+
+## 11. Strong constraints
+
+- Do not return only a slide outline when the user asked to generate PPTX.
+- Do not expose raw schema as the final answer unless debugging is requested.
+- Do not invent download URLs.
+- Do not change web download link logic.
+- Do not use fallback screenshots as final visual PPTX.
+- Do not claim image-based PPTX is fully editable.
+- Do not overfill slides with long text.
+- Prefer one-shot generation tools for normal user requests.
