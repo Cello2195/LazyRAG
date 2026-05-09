@@ -35,6 +35,13 @@ DEFAULT_TOOLS = [
     'pptx_render_thumbnails',
     'pptx_qa',
     'pptx_repair_schema',
+    'html_deck_validate_schema',
+    'html_deck_create_from_schema',
+    'html_deck_preview',
+    'html_deck_qa',
+    'html_deck_render_screenshots',
+    'pptx_create_from_html_screenshots',
+    'html_deck_generate_visual_pptx',
     'artifact_save',
 ]
 
@@ -186,7 +193,7 @@ def _build_runtime_system_prompt(config: dict, available_tools: list[str]) -> st
         or 'url_fetch' in available_tools
     ):
         prompt_parts.append(SEARCH_GUIDANCE)
-    if 'pptx_create_from_schema' in available_tools:
+    if 'pptx_create_from_schema' in available_tools or 'html_deck_generate_visual_pptx' in available_tools:
         prompt_parts.append(PPTX_GENERATION_GUIDANCE)
 
     return '\n\n'.join(prompt_parts)
