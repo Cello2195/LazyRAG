@@ -149,6 +149,32 @@ def test_html_deck_qa_detects_placeholder(tmp_path):
     assert any(item['code'] == 'placeholder_residue' for item in qa['issues'])
 
 
+def test_html_deck_qa_marks_fallback_not_export_ready(tmp_path):
+    _ensure_import_path()
+    _setup_upload_root(tmp_path)
+    from chat.html_deck.renderer import create_html_deck_from_schema
+    from chat.html_deck.qa import run_html_deck_qa
+
+    result = create_html_deck_from_schema(_sample_schema(), output_dir=tmp_path / 'deck', persist_index=False)
+    qa = run_html_deck_qa(
+        deck_dir=result['deck_dir'],
+        slide_paths=result['slide_paths'],
+        screenshot_result={
+            'success': False,
+            'fallback_used': True,
+            'is_real_browser_render': False,
+            'can_export_visual_pptx': False,
+            'error_message': 'playwright unavailable',
+            'screenshot_paths': [],
+        },
+    )
+    assert qa['success'] is True
+    assert qa['summary']['export_ready'] is False
+    codes = {item['code'] for item in qa['warnings']}
+    assert 'fallback_screenshot_used' in codes
+    assert 'visual_export_not_ready' in codes
+
+
 def test_legacy_dark_layout_alias_compat(tmp_path):
     _ensure_import_path()
     _setup_upload_root(tmp_path)

@@ -78,6 +78,11 @@ def html_deck_create_from_schema(
 
     This creates slide-XX.html files and an index.html preview. It does not
     require Playwright or Node.
+
+    Args:
+        deck_schema: Structured deck schema for visual deck rendering.
+        deck_name: Output deck folder/artifact stem.
+        theme: Optional visual theme name or palette override.
     """
     return create_html_deck_from_schema(deck_schema, theme=theme, deck_name=_safe_stem(deck_name))
 
@@ -145,11 +150,21 @@ def html_deck_render_screenshots(
     viewport_width: int = 960,
     viewport_height: int = 540,
     device_scale_factor: float = 2.0,
+    allow_fallback_preview: bool = False,
 ) -> Dict[str, Any]:
     """Render HTML slides into PNG screenshots via Playwright.
 
     If Playwright/browser runtime is not available, returns success=false while
     keeping the HTML deck usable.
+
+    Args:
+        deck_dir: Directory containing slide-XX.html files.
+        slide_paths: Optional explicit HTML slide paths.
+        output_dir: Optional output directory for PNG screenshots.
+        viewport_width: Browser viewport width in pixels.
+        viewport_height: Browser viewport height in pixels.
+        device_scale_factor: Browser device scale factor for high-resolution screenshots.
+        allow_fallback_preview: Whether to allow Pillow fallback previews for debugging.
     """
     return render_html_deck_screenshots(
         deck_dir=deck_dir,
@@ -158,6 +173,7 @@ def html_deck_render_screenshots(
         viewport_width=viewport_width,
         viewport_height=viewport_height,
         device_scale_factor=device_scale_factor,
+        allow_fallback_preview=allow_fallback_preview,
     )
 
 
@@ -195,6 +211,12 @@ def html_deck_generate_visual_pptx(
 
     If Playwright is unavailable, this still returns a persisted HTML deck and
     the screenshot/PPTX step reports a graceful warning.
+
+    Args:
+        deck_schema: Structured deck schema for visual deck rendering.
+        filename: Output visual PPTX filename.
+        theme: Optional visual theme name or palette override.
+        render_screenshots: Whether to run screenshot and PPTX export steps.
     """
     stem = _safe_stem(filename, 'visual_deck')
     html_result = create_html_deck_from_schema(deck_schema, theme=theme, deck_name=stem)
@@ -215,8 +237,15 @@ def html_deck_generate_visual_pptx(
         screenshot_result = render_html_deck_screenshots(
             deck_dir=html_result.get('deck_dir'),
             slide_paths=html_result.get('slide_paths') or [],
+            allow_fallback_preview=False,
         )
-        if screenshot_result.get('success'):
+        can_export_visual = bool(
+            screenshot_result.get('success')
+            and screenshot_result.get('can_export_visual_pptx') is True
+            and screenshot_result.get('is_real_browser_render') is True
+            and screenshot_result.get('fallback_used') is not True
+        )
+        if can_export_visual:
             pptx_result = pptx_create_from_html_screenshots(
                 screenshot_result.get('screenshot_paths') or [],
                 filename=f'{stem}.pptx',
@@ -255,6 +284,18 @@ def html_deck_generate_visual_pptx(
             'error_message': f'html deck bundle save failed: {exc}',
         }
 
+    can_export_visual = bool(
+        screenshot_result.get('success')
+        and screenshot_result.get('can_export_visual_pptx') is True
+        and screenshot_result.get('is_real_browser_render') is True
+        and screenshot_result.get('fallback_used') is not True
+    )
+    warnings: list[str] = []
+    if screenshot_result and screenshot_result.get('warnings'):
+        warnings.extend(screenshot_result.get('warnings') or [])
+    if render_screenshots and not can_export_visual:
+        warnings.append('visual PPTX export requires real Playwright/Chromium screenshots; fallback previews are not exportable.')
+
     return {
         'success': True,
         'html_deck': html_result,
@@ -262,9 +303,10 @@ def html_deck_generate_visual_pptx(
         'html_qa': qa_result,
         'screenshot_result': screenshot_result,
         'pptx_result': pptx_result,
+        'can_export_visual_pptx': can_export_visual,
         'artifact': (saved_pptx.get('artifact') if isinstance(saved_pptx, dict) else {}) or saved_pptx,
         'artifacts': bundle_result.get('artifacts') if isinstance(bundle_result, dict) else {},
         'output_mode': 'visual_pptx',
         'editable': False,
-        'warnings': [] if screenshot_result.get('success') else (screenshot_result.get('warnings') or ['visual PPTX screenshot export was skipped/unavailable']),
+        'warnings': warnings,
     }

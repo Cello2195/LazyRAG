@@ -3,6 +3,9 @@ import os
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlparse
 
+from psycopg2 import connect
+from psycopg2.extensions import connection as PGConnection
+
 
 SHARED_DB_ENV_KEY = 'LAZYRAG_DATABASE_URL'
 
@@ -67,3 +70,57 @@ def require_shared_db_config(service_name: str) -> Dict[str, Any]:
 def get_doc_task_db_config() -> Optional[Dict[str, Any]]:
     """Backward-compatible alias for the shared database config."""
     return get_shared_db_config()
+
+
+def _connect_postgres(db_config: Dict[str, Any]) -> PGConnection:
+    return connect(
+        dbname=db_config.get('db_name') or 'app',
+        user=db_config.get('user') or '',
+        password=db_config.get('password') or '',
+        host=db_config.get('host') or 'localhost',
+        port=int(db_config.get('port') or 5432),
+    )
+
+
+def ensure_parsing_service_schema_compat(db_config: Dict[str, Any], *, service_name: str = 'DocumentProcessor') -> None:
+    """Apply lightweight forward-compatible schema patches for LazyLLM parsing tables.
+
+    New LazyLLM builds read ``lazyllm_algorithm.node_group_ids``. Older deployments
+    may have tables created before this column existed, causing startup failure.
+    """
+    if not db_config:
+        return
+    conn: Optional[PGConnection] = None
+    try:
+        conn = _connect_postgres(db_config)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'lazyllm_algorithm'
+                    ) THEN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = 'lazyllm_algorithm'
+                              AND column_name = 'node_group_ids'
+                        ) THEN
+                            ALTER TABLE public.lazyllm_algorithm
+                            ADD COLUMN node_group_ids TEXT DEFAULT '[]';
+                        END IF;
+                    END IF;
+                END $$;
+                """
+            )
+    except Exception as exc:
+        # Non-fatal: keep startup behavior, but make root cause explicit.
+        print(f'[{service_name}] schema compatibility check failed: {exc}')
+    finally:
+        if conn is not None:
+            conn.close()

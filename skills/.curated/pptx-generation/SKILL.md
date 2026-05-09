@@ -27,8 +27,9 @@ Be explicit when using `visual_pptx`: the exported PPTX is usually screenshot/im
 5. Generate editable PPTX using `pptx_create_from_schema` or `pptx_generate_with_qa_loop`.
 6. Run `pptx_parse` and `pptx_qa`.
 7. If QA shows fixable issues, call `pptx_repair_schema`, regenerate once, and rerun QA.
-8. Save the final result using `artifact_save` and return `file_path` and `download_url`.
-9. Use `pptx_render_thumbnails` for preview if needed; if unavailable, still return the PPTX artifact.
+8. Save the final result using `artifact_save` and return signed URL fields first: `download_link` (preferred), then `download_url`/`file_url`.
+9. Never treat `relative_path` or local `file_path` as a web download URL.
+10. Use `pptx_render_thumbnails` for preview if needed; if unavailable, still return the PPTX artifact.
 
 ## Visual PPTX workflow
 

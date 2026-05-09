@@ -2,11 +2,12 @@ import signal
 import threading
 
 from lazyllm.tools.rag.parsing_service import DocumentProcessor
-from processor.db import require_shared_db_config
+from processor.db import ensure_parsing_service_schema_compat, require_shared_db_config
 from processor.env import env_int
 
 
 db_config = require_shared_db_config('DocumentProcessor')
+ensure_parsing_service_schema_compat(db_config, service_name='DocumentProcessor')
 doc_processor = DocumentProcessor(
     port=env_int('LAZYRAG_DOCUMENT_PROCESSOR_PORT', 8000),
     db_config=db_config,

@@ -262,16 +262,13 @@ ssh mymac-via-tunnel '
 '
 ```
 
-### 4.1 修改代码后如何生效（是否需要重启）
+### 4.1 修改代码后如何生效
 
-原因是当前部署方式里，大部分服务代码打包在镜像内，改了仓库代码后，需要重新 build + recreate 容器才会生效。
-
-如果你改的是服务器上的代码，建议按下面顺序执行：
+#### 普通代码修改：同步到 Mac + 重启 chat，不 rebuild
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 
-# 1) 先把最新代码同步到本机 Mac
 cd /home/mnt/xiongyida/project
 rsync -az --delete \
   --exclude ".git" \
@@ -283,7 +280,66 @@ rsync -az --delete \
   --exclude "data/watch/" \
   LazyRAG/ mymac-via-tunnel:/Users/xiongyida/project/LazyRAG/
 
-# 2) 全量重建并重启（最稳妥）
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  docker compose restart chat
+  docker compose ps chat
+'
+```
+
+#### 修改后直接跑 HTML/PPTX 调试脚本
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  docker compose exec chat bash -lc "PYTHONPATH=algorithm python scripts/debug_html_deck_generation.py --theme auto"
+'
+```
+
+#### 需要真实截图和 visual.pptx 时
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  docker compose exec chat bash -lc "PYTHONPATH=algorithm python scripts/debug_html_deck_generation.py --theme auto --require-screenshots"
+'
+```
+
+#### 只看 chat 日志
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+
+ssh mymac-via-tunnel '
+  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
+  cd /Users/xiongyida/project/LazyRAG
+  docker compose logs --tail=200 chat
+'
+```
+
+#### 修改依赖 / Dockerfile / compose / 系统库时才 rebuild
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+
+cd /home/mnt/xiongyida/project
+rsync -az --delete \
+  --exclude ".git" \
+  --exclude "__pycache__" \
+  --exclude "*.pyc" \
+  --exclude "data/state/" \
+  --exclude "data/core/uploads/" \
+  --exclude "data/scan/" \
+  --exclude "data/watch/" \
+  LazyRAG/ mymac-via-tunnel:/Users/xiongyida/project/LazyRAG/
+
 ssh mymac-via-tunnel '
   export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
   export DOCKER_BUILDKIT=1
@@ -293,14 +349,11 @@ ssh mymac-via-tunnel '
   export PIP_DEFAULT_TIMEOUT=1200
   export PIP_RETRIES=30
   cd /Users/xiongyida/project/LazyRAG
-  test -f algorithm/chat/runtime_models.macproxy.yaml || \
-    (cp algorithm/chat/runtime_models.inner.yaml algorithm/chat/runtime_models.macproxy.yaml && \
-     sed -i "" "s|http://10.119.27.151:2269|http://host.docker.internal:2269|g" algorithm/chat/runtime_models.macproxy.yaml)
   make up-build
 '
 ```
 
-如果只改了某一个服务，可以只重建该服务（更快）：
+#### 如果只想重建 chat 一个服务
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -309,18 +362,9 @@ ssh mymac-via-tunnel '
   export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
   cd /Users/xiongyida/project/LazyRAG
   docker compose up -d --build chat
+  docker compose ps chat
 '
 ```
-
-ssh mymac-via-tunnel '
-  export PATH=/Applications/Docker.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH
-  cd /Users/xiongyida/project/LazyRAG
-  docker compose restart chat
-'
-
-
-常见服务名示例：`chat`、`evo-api`、`lazyllm-algo`、`frontend`、`core`、`auth-service`。
-改完后建议执行一次 `docker compose ps`，确认目标服务是 `Up (healthy)`。
 
 ### 5. 查看状态（服务器执行）
 

@@ -81,7 +81,6 @@ def _core_api_public_base_url() -> str:
     base = (
         _agentic_config().get('core_api_public_url')
         or os.getenv('LAZYRAG_CORE_API_PUBLIC_URL')
-        or os.getenv('LAZYRAG_PUBLIC_BASE_URL')
         or ''
     )
     return str(base).rstrip('/')
@@ -96,6 +95,24 @@ def _looks_like_internal_host(base_url: str) -> bool:
         return False
     host = (parsed.hostname or '').strip().lower()
     return host in {'core', 'localhost', '127.0.0.1', '0.0.0.0', '::1'}
+
+
+def _looks_like_static_cdn_host(base_url: str) -> bool:
+    if not base_url:
+        return False
+    try:
+        parsed = urlparse(base_url)
+    except Exception:
+        return False
+    host = (parsed.hostname or '').strip().lower()
+    if not host:
+        return False
+    # Common static CDN/object-storage hosts should not be used as API base.
+    if any(token in host for token in ('filecdn', '.oss-', 'oss-', '.oss.', 'aliyuncs.com')):
+        return True
+    if host.endswith('.cdn') or host.startswith('cdn.'):
+        return True
+    return False
 
 
 def _static_file_route_prefix() -> str:
@@ -141,7 +158,9 @@ def _file_delivery_mode() -> str:
     mode = str(value).strip().lower().replace('-', '_')
     if mode in {'core_static', 'chat_proxy'}:
         return mode
-    # Prefer chat-proxy by default to avoid host-level /api/core proxy pitfalls.
+    # Default to chat_proxy because this route is served by the same chat
+    # service that generated the artifact and is less sensitive to external
+    # gateway/CDN path rewriting.
     return 'chat_proxy'
 
 
@@ -150,11 +169,20 @@ def _absolute_url(path: str) -> str:
         return ''
     if path.startswith('http://') or path.startswith('https://'):
         return path
+    # In chat-proxy mode the signed URL is served by chat itself. Returning
+    # relative paths avoids leaking/guessing an external host that may be
+    # unreachable from the browser environment.
+    if _file_delivery_mode() == 'chat_proxy':
+        return ''
     # Prefer explicit public base when available.
     public_base = _core_api_public_base_url()
     base = public_base or _core_api_base_url()
     if not base:
         return path
+    if _looks_like_static_cdn_host(base):
+        # A static CDN/object-store domain cannot serve /api/chat/... signed files.
+        # Return empty to force callers to use relative URLs.
+        return ''
     if not public_base and _looks_like_internal_host(base):
         # Avoid returning container-internal addresses such as http://core:8000.
         return ''
@@ -279,7 +307,6 @@ def _build_payload(
         'filename': file_name,
         'file_path': local_path,
         'local_path': local_path,
-        'relative_path': rel,
         'size_bytes': stat.st_size,
         'sha256': sha256,
         'created_at': created_at,
@@ -290,6 +317,10 @@ def _build_payload(
     }
     absolute_file_url = _absolute_url(file_url)
     absolute_download_url = _absolute_url(download_url)
+    preferred_file_link = absolute_file_url or file_url
+    preferred_download_link = absolute_download_url or download_url
+    base['file_link'] = preferred_file_link
+    base['download_link'] = preferred_download_link
     if absolute_file_url:
         base['absolute_file_url'] = absolute_file_url
     if absolute_download_url:
@@ -301,7 +332,6 @@ def _build_payload(
         'filename': file_name,
         'file_path': local_path,
         'local_path': local_path,
-        'relative_path': rel,
         'file_size': stat.st_size,
         'size_bytes': stat.st_size,
         'sha256': sha256,
@@ -310,8 +340,12 @@ def _build_payload(
         'download_url': download_url,
         'content_url': file_url,
         'preview_url': file_url,
-        'absolute_file_url': absolute_file_url,
-        'absolute_download_url': absolute_download_url,
+        'absolute_file_url': absolute_file_url or '',
+        'absolute_download_url': absolute_download_url or '',
+        'file_link': preferred_file_link,
+        'download_link': preferred_download_link,
+        # Internal storage metadata only.
+        'storage_relative_path': rel,
     }
     if isinstance(related_artifacts, dict) and related_artifacts:
         base['related_artifacts'] = related_artifacts

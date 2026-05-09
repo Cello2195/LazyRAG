@@ -187,6 +187,9 @@ def main() -> int:
     from chat.tools.html_deck import html_deck_preview
 
     schema = _sample_visual_schema(args.theme, palette)
+    visual_pptx_path = root / 'visual.pptx'
+    if visual_pptx_path.exists():
+        visual_pptx_path.unlink()
 
     normalized = normalize_visual_deck_schema(schema)
     print('Normalized schema: success')
@@ -230,21 +233,38 @@ def main() -> int:
         viewport_width=960,
         viewport_height=540,
         device_scale_factor=2.0,
+        allow_fallback_preview=not args.require_screenshots,
     )
     screenshot_success = bool(screenshots.get('success'))
-    print(f"Screenshots: {'success' if screenshot_success else 'skipped'}")
+    fallback_used = bool(screenshots.get('fallback_used'))
+    real_browser_render = screenshots.get('is_real_browser_render') is True
+    can_export_visual_pptx = screenshots.get('can_export_visual_pptx') is True
+    real_screenshot_success = bool(
+        screenshot_success
+        and real_browser_render
+        and (not fallback_used)
+        and can_export_visual_pptx
+    )
+    screenshot_status = 'real-browser-success'
+    if fallback_used:
+        screenshot_status = 'fallback-preview'
+    elif not screenshot_success:
+        screenshot_status = 'skipped'
+    print(f"Screenshots: {screenshot_status}")
     print(f"Screenshot count: {len(screenshots.get('screenshot_paths') or [])}")
+    print(f"Fallback used: {str(fallback_used).lower()}")
+    print(f"Real browser render: {str(real_browser_render).lower()}")
+    print(f"Can export visual PPTX: {str(can_export_visual_pptx).lower()}")
     if screenshots.get('warnings'):
         print(f"Screenshot warnings: {json.dumps(screenshots.get('warnings'), ensure_ascii=False)}")
 
-    if args.require_screenshots and not screenshot_success:
+    if args.require_screenshots and not real_screenshot_success:
         print(f"Screenshot error: {screenshots.get('error_message')}")
         return 2
 
-    visual_pptx_path = root / 'visual.pptx'
     pptx_result: Dict[str, Any] = {}
     artifact_result: Dict[str, Any] = {}
-    if screenshot_success:
+    if real_screenshot_success:
         pptx_result = create_pptx_from_slide_images(screenshots.get('screenshot_paths') or [], visual_pptx_path)
         if not pptx_result.get('success'):
             raise RuntimeError(json.dumps(pptx_result, ensure_ascii=False, indent=2))
@@ -267,6 +287,8 @@ def main() -> int:
         print(f"Artifact saved: {artifact_payload.get('file_path')}")
         print(f"Final visual PPTX path: {artifact_payload.get('file_path')}")
         print(f"Download URL: {artifact_payload.get('download_url')}")
+    else:
+        print('Visual PPTX skipped: screenshots are not real-browser export-ready')
 
     bundle = save_html_deck_bundle(
         index_path=html_result['index_path'],
@@ -286,7 +308,7 @@ def main() -> int:
     print(f"Post QA issues: {qa_after.get('summary', {}).get('issue_count')}")
     print(f"Post QA warnings: {qa_after.get('summary', {}).get('warning_count')}")
 
-    if screenshot_success and not Path(pptx_result['file_path']).exists():
+    if real_screenshot_success and not Path(pptx_result['file_path']).exists():
         raise RuntimeError('visual.pptx not found after export')
 
     return 0

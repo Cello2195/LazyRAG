@@ -12,7 +12,8 @@ ARG PIP_RETRIES=30
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT} \
-    PIP_RETRIES=${PIP_RETRIES}
+    PIP_RETRIES=${PIP_RETRIES} \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 RUN --mount=type=secret,id=apt_http_proxy,required=false \
     --mount=type=secret,id=apt_https_proxy,required=false \
@@ -41,13 +42,41 @@ RUN --mount=type=secret,id=apt_http_proxy,required=false \
         curl \
         build-essential \
         gcc \
+        fontconfig \
+        fonts-noto-cjk \
+        fonts-wqy-zenhei \
         libgl1 \
         libglib2.0-0 \
         libsm6 \
         libxext6 \
         libxrender1 \
         libxcb1 \
+        libasound2 \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libatspi2.0-0 \
+        libcairo2 \
+        libcups2 \
+        libdbus-1-3 \
+        libdrm2 \
+        libgbm1 \
+        libgtk-3-0 \
+        libnspr4 \
+        libnss3 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libwayland-client0 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxfixes3 \
+        libxkbcommon0 \
+        libxrandr2 \
+        libxshmfence1 \
+        libxss1 \
         python3-dev \
+    && fc-cache -fv \
     && update-ca-certificates \
     && rm -f /etc/apt/apt.conf.d/99proxy \
     && rm -rf /var/lib/apt/lists/*
@@ -73,7 +102,14 @@ RUN --mount=type=secret,id=apt_http_proxy,required=false \
       "fastapi>=0.111.0" "loguru>=0.7.2" "pydantic>=2.11.7,<3.0.0" \
       "requests>=2.32.2" "uvicorn>=0.23.2" "cloudpickle>=3.0.0" \
       "docstring-parser>=0.16,<0.17" "json5>=0.9.25,<0.10.0" \
-      "pyjwt>=2.8.0" "psutil>=6.0.0,<7.0.0" "deepdiff>=8.6.1"; \
+      "pyjwt>=2.8.0" "psutil>=6.0.0,<7.0.0" "deepdiff>=8.6.1" \
+      "playwright>=1.52,<2"; \
+    mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"; \
+    python -m playwright install chromium; \
+    if fc-match "Noto Sans CJK SC" | grep -qi "DejaVu Sans"; then \
+      echo "FATAL: Noto Sans CJK SC still resolves to DejaVu Sans; CJK fonts missing."; \
+      exit 1; \
+    fi; \
     site_packages="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
     printf '/opt/lazyllm\n' > "${site_packages}/lazyllm-main.pth"; \
     printf '%s\n' '#!/usr/bin/env sh' \

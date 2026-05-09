@@ -16,19 +16,16 @@ Use this skill when the user asks for a polished, MiniMax-like, magazine-style, 
 
 ## Theme policy
 
-Do **not** force every visual deck into one dark-tech palette. `dark_tech` is only a reference style. Prefer `visual_theme="auto"` unless the user gives a specific style. The renderer can use named themes or custom palettes:
+Do **not** force every visual deck into one dark-tech palette, and also do **not** create a bag of unrelated visual styles. The default design system is a single Guizang-style family: editorial framing, large numbering, strong cards, SVG ornaments, and magazine-like page rhythm. Prefer `visual_theme="auto"` unless the user gives a specific style. The renderer supports coherent variants:
 
-- `cyber_blue`: technical / AI / software / infrastructure decks.
-- `dark_tech`: dark MiniMax-like tech deck.
-- `corporate_blue`: business, product, strategy, pitch decks.
-- `academic_light`: research, paper, lecture, thesis-style decks.
-- `warm_editorial`: magazine/editorial/brand storytelling decks.
-- `emerald_dark`: science, bio, drug discovery, sustainability decks.
-- `violet_neon`: creative, futuristic, design-heavy decks.
-- `midnight_gold`: premium/keynote/launch decks.
-- `light_magazine`: clean general-purpose visual deck.
+- `guizang_ink`: electronic-ink / dark editorial keynote.
+- `guizang_aurora`: AI / Agent / infrastructure / demo decks.
+- `guizang_paper`: research, lecture, viewpoint, warm editorial decks.
+- `guizang_blueprint`: project, architecture, business-technical plans.
+- `guizang_business`: polished product / strategy / executive decks.
+- `guizang_noir`: premium launch / final keynote decks.
 
-If the user provides colors, pass a custom palette, for example:
+Backward-compatible names such as `cyber_blue`, `dark_tech`, `corporate_blue`, `academic_light`, `warm_editorial`, `emerald_dark`, `violet_neon`, `midnight_gold`, and `light_magazine` are accepted, but they should resolve to this unified visual family instead of becoming unrelated templates. If the user provides colors, pass a custom palette, for example:
 
 ```json
 {"base":"corporate_blue", "palette":{"primary":"#7c3aed", "background":"#faf5ff", "surface":"#ffffff"}}
@@ -38,12 +35,13 @@ If the user provides colors, pass a custom palette, for example:
 
 1. Gather evidence with `kb_search`, `web_search`, `url_fetch`, or `arxiv_search` if the deck needs factual content.
 2. Create a concise `deck_schema`. Include `title`, `subtitle`, `language`, `audience`, optional `visual_theme` or custom palette, and `slides`.
-3. Plan the visual rhythm before rendering: `cover -> toc -> section_divider -> metric_cards -> cards/content -> comparison/table -> summary/references`.
+3. Plan the visual rhythm before rendering: `cover -> toc -> section_divider -> metric_poster -> challenge/card_grid -> editorial_content -> comparison/table -> quote/process -> summary/references`. Avoid repeating the same title+rule+card layout across pages.
 4. Call `html_deck_validate_schema` and then `html_deck_create_from_schema`.
 5. Call `html_deck_preview` to return preview path/URL, then call `html_deck_qa`.
 6. Render screenshots + export PPTX with `html_deck_render_screenshots` and `pptx_create_from_html_screenshots`, or use `html_deck_generate_visual_pptx` for one-shot flow.
 7. If screenshot export is unavailable, return the HTML deck and explain that Playwright/browser runtime is needed for image-based PPTX export.
-8. If an image-based PPTX is created, return the PPTX artifact URL/path and mention that it is image-based.
+8. If an image-based PPTX is created, return signed download URL fields first (`download_link`, then `download_url`/`file_url`) and mention that it is image-based.
+9. Do not present `relative_path` or local `file_path` as a web download URL.
 
 ## Schema tips
 
@@ -52,7 +50,7 @@ If the user provides colors, pass a custom palette, for example:
 - Use `columns`, `left/right`, or `headers/rows` for comparison/table pages.
 - Add `evidence_refs` to preserve source traceability.
 - Keep each slide visually sparse: short title, few bullets, one dominant visual pattern.
-- Avoid repeating exactly the same layout and color mood for too many consecutive slides.
+- Avoid repeating exactly the same layout and color mood for too many consecutive slides. Different themes must change composition tokens, not only colors.
 
 ## Do not
 

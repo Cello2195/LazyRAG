@@ -1,4 +1,5 @@
 import os
+import inspect
 from urllib.parse import urlparse
 
 from lazyllm.tools.rag import Document, MineruPDFReader, PDFReader
@@ -100,21 +101,61 @@ def _build_pdf_reader():
     raise ValueError(f'Unsupported LAZYRAG_OCR_SERVER_TYPE: {ocr_type!r}')
 
 
+def _document_processor_accepts_store_conf() -> bool:
+    """Return whether current LazyLLM expects store_conf on DocumentProcessor."""
+    try:
+        params = inspect.signature(DocumentProcessor.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return 'store_conf' in params
+
+
+def _build_document_processor(processor_url: str, store_conf: dict) -> tuple[DocumentProcessor, bool]:
+    """Create DocumentProcessor for both old/new LazyLLM APIs.
+
+    Returns:
+        (processor, store_conf_bound_to_processor)
+    """
+    if _document_processor_accepts_store_conf():
+        return DocumentProcessor(url=processor_url, store_conf=store_conf), True
+    return DocumentProcessor(url=processor_url), False
+
+
 def build_document() -> Document:
     processor_url = os.getenv('LAZYRAG_DOCUMENT_PROCESSOR_URL', 'http://localhost:8000')
     server_port = get_algo_server_port()
     settings = get_retrieval_settings()
     embed = {k: get_automodel(k) for k in settings.embed_keys}
+    store_conf = _build_store_config(settings.index_kwargs)
+    processor, store_conf_bound_to_processor = _build_document_processor(processor_url, store_conf)
 
-    docs = Document(
-        dataset_path=None,
-        name=ALGO_ID,
-        embed=embed,
-        store_conf=_build_store_config(settings.index_kwargs),
-        manager=DocumentProcessor(url=processor_url),
-        doc_fields=[],
-        server=server_port,
-    )
+    document_kwargs = {
+        'dataset_path': None,
+        'name': ALGO_ID,
+        'embed': embed,
+        'manager': processor,
+        'doc_fields': [],
+        'server': server_port,
+    }
+    if not store_conf_bound_to_processor:
+        document_kwargs['store_conf'] = store_conf
+
+    try:
+        docs = Document(**document_kwargs)
+    except ValueError as exc:
+        error_text = str(exc)
+        # LazyLLM new API: store_conf must be bound to DocumentProcessor.
+        if 'must not be passed to Document' in error_text and 'DocumentProcessor' in error_text:
+            processor = DocumentProcessor(url=processor_url, store_conf=store_conf)
+            document_kwargs['manager'] = processor
+            document_kwargs.pop('store_conf', None)
+            docs = Document(**document_kwargs)
+        # LazyLLM old API: store_conf must be passed to Document.
+        elif 'store_conf' in error_text and 'required' in error_text and 'DocumentProcessor' in error_text:
+            document_kwargs['store_conf'] = store_conf
+            docs = Document(**document_kwargs)
+        else:
+            raise
 
     docs.add_reader('*.pdf', _build_pdf_reader())
     docs.create_node_group(name='block', display_name='paragraph slice',

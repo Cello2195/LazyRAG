@@ -129,12 +129,32 @@ def _check_screenshot_blank(path: Path) -> bool:
 def _check_screenshots(
     screenshot_result: Dict[str, Any] | None,
     slide_count: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], bool]:
     issues: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
     details: List[Dict[str, Any]] = []
+    export_ready = False
     if not screenshot_result:
-        return issues, warnings, details
+        return issues, warnings, details, export_ready
+    fallback_used = bool(screenshot_result.get('fallback_used'))
+    real_browser = screenshot_result.get('is_real_browser_render') is True
+    can_export = screenshot_result.get('can_export_visual_pptx') is True
+    if fallback_used:
+        warnings.append(
+            _entry(
+                'warning',
+                'fallback_screenshot_used',
+                'Pillow fallback preview detected; this is not acceptable for formal visual_pptx export',
+            )
+        )
+    if not can_export:
+        warnings.append(
+            _entry(
+                'warning',
+                'visual_export_not_ready',
+                'screenshot result is not export-ready for visual_pptx',
+            )
+        )
     if not screenshot_result.get('success'):
         warnings.append(
             _entry(
@@ -143,7 +163,7 @@ def _check_screenshots(
                 screenshot_result.get('error_message') or 'screenshot rendering unavailable',
             )
         )
-        return issues, warnings, details
+        return issues, warnings, details, export_ready
 
     paths = [Path(p).expanduser().resolve() for p in screenshot_result.get('screenshot_paths') or []]
     if len(paths) != slide_count:
@@ -173,7 +193,14 @@ def _check_screenshots(
             warnings.append(warning)
             item['warnings'].append(warning)
         details.append(item)
-    return issues, warnings, details
+    export_ready = bool(
+        screenshot_result.get('success')
+        and real_browser
+        and (not fallback_used)
+        and can_export
+        and not issues
+    )
+    return issues, warnings, details, export_ready
 
 
 def run_html_deck_qa(
@@ -308,7 +335,8 @@ def run_html_deck_qa(
             )
         )
 
-    shot_issues, shot_warnings, shot_details = _check_screenshots(screenshot_result, len(paths))
+    html_passed = len(issues) == 0
+    shot_issues, shot_warnings, shot_details, export_ready = _check_screenshots(screenshot_result, len(paths))
     issues.extend(shot_issues)
     warnings.extend(shot_warnings)
     if shot_details:
@@ -317,6 +345,8 @@ def run_html_deck_qa(
     return {
         'success': True,
         'passed': len(issues) == 0,
+        'html_passed': html_passed,
+        'export_ready': export_ready,
         'issues': issues,
         'warnings': warnings,
         'details': details,
@@ -326,5 +356,7 @@ def run_html_deck_qa(
             'warning_count': len(warnings),
             'theme_used': theme_used or None,
             'layout_count': len(layout_names),
+            'html_passed': html_passed,
+            'export_ready': export_ready,
         },
     }

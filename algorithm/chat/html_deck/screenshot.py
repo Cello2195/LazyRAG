@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import re
 from pathlib import Path
@@ -159,6 +160,9 @@ def _render_fallback_pngs(
         ],
         'error_message': '',
         'fallback_used': True,
+        'is_real_browser_render': False,
+        'can_export_visual_pptx': False,
+        'render_quality': 'debug_fallback',
     }
 
 
@@ -181,22 +185,39 @@ def _missing_playwright_result(error_message: str, slides: List[Path]) -> Dict[s
         'page_count': len(slides),
         'warnings': warnings,
         'error_message': error_message,
+        'fallback_used': False,
+        'is_real_browser_render': False,
+        'can_export_visual_pptx': False,
+        'render_quality': 'unavailable',
+        'install_hint': 'python -m playwright install chromium',
     }
 
 
 def _find_chromium_binaries() -> List[Path]:
-    base = Path.home() / '.cache' / 'ms-playwright'
+    bases: List[Path] = []
+    env_path = os.getenv('PLAYWRIGHT_BROWSERS_PATH', '').strip()
+    if env_path and env_path != '0':
+        bases.append(Path(env_path).expanduser())
+    bases.append(Path.home() / '.cache' / 'ms-playwright')
+    bases.append(Path('/ms-playwright'))
+
     candidates: List[Path] = []
-    if not base.exists():
-        return candidates
+    seen: set[str] = set()
     patterns = [
         'chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell',
         'chromium-*/chrome-linux/chrome',
     ]
-    for pattern in patterns:
-        for item in sorted(base.glob(pattern)):
-            if item.exists() and item.is_file():
-                candidates.append(item)
+    for base in bases:
+        key = str(base.resolve()) if base.exists() else str(base)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not base.exists():
+            continue
+        for pattern in patterns:
+            for item in sorted(base.glob(pattern)):
+                if item.exists() and item.is_file():
+                    candidates.append(item)
     return candidates
 
 
@@ -236,8 +257,13 @@ def render_html_deck_screenshots(
     viewport_height: int = 540,
     device_scale_factor: float = 2.0,
     timeout_ms: int = 20000,
-    allow_fallback: bool = True,
+    allow_fallback_preview: bool = False,
+    allow_fallback: bool | None = None,
 ) -> Dict[str, Any]:
+    if allow_fallback is not None:
+        # Backward compatibility for older callers.
+        allow_fallback_preview = bool(allow_fallback)
+
     slides = _resolve_slide_paths(deck_dir, slide_paths)
     if not slides:
         return {
@@ -247,6 +273,10 @@ def render_html_deck_screenshots(
             'page_count': 0,
             'warnings': ['no HTML slides found for screenshot rendering'],
             'error_message': 'no HTML slides found',
+            'fallback_used': False,
+            'is_real_browser_render': False,
+            'can_export_visual_pptx': False,
+            'render_quality': 'unavailable',
         }
 
     out_dir = Path(output_dir).expanduser().resolve() if output_dir else slides[0].parent / 'screenshots'
@@ -255,19 +285,31 @@ def render_html_deck_screenshots(
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:  # pragma: no cover
-        if allow_fallback:
+        if allow_fallback_preview:
             fallback = _render_fallback_pngs(slides, out_dir, int(viewport_width), int(viewport_height))
             if fallback.get('success'):
-                fallback['warnings'] = [f'Playwright import failed: {exc}'] + (fallback.get('warnings') or [])
+                fallback['success'] = False
+                fallback['warnings'] = [
+                    f'Playwright import failed: {exc}',
+                    'Fallback preview is for debugging only and cannot be exported as formal visual PPTX.',
+                ] + (fallback.get('warnings') or [])
+                fallback['error_message'] = f'playwright import failed: {exc}'
+                fallback['install_hint'] = 'pip install playwright && python -m playwright install chromium'
                 return fallback
         return _missing_playwright_result(f'playwright import failed: {exc}', slides)
 
     preflight_error = _preflight_browser_runtime_error()
     if preflight_error:
-        if allow_fallback:
+        if allow_fallback_preview:
             fallback = _render_fallback_pngs(slides, out_dir, int(viewport_width), int(viewport_height))
             if fallback.get('success'):
-                fallback['warnings'] = [preflight_error] + (fallback.get('warnings') or [])
+                fallback['success'] = False
+                fallback['warnings'] = [
+                    preflight_error,
+                    'Fallback preview is for debugging only and cannot be exported as formal visual PPTX.',
+                ] + (fallback.get('warnings') or [])
+                fallback['error_message'] = preflight_error
+                fallback['install_hint'] = 'python -m playwright install chromium'
                 return fallback
         return _missing_playwright_result(preflight_error, slides)
 
@@ -283,27 +325,25 @@ def render_html_deck_screenshots(
             page = context.new_page()
             for idx, slide in enumerate(slides, start=1):
                 target = out_dir / f'slide-{idx:02d}.png'
-                page.goto(slide.as_uri(), wait_until='domcontentloaded', timeout=timeout_ms)
-                page.wait_for_timeout(120)
-                page.screenshot(
-                    path=str(target),
-                    type='png',
-                    full_page=False,
-                    clip={
-                        'x': 0,
-                        'y': 0,
-                        'width': int(viewport_width),
-                        'height': int(viewport_height),
-                    },
-                )
+                page.goto(f'{slide.as_uri()}?screenshot=1', wait_until='networkidle', timeout=timeout_ms)
+                locator = page.locator('.slide-content').first
+                locator.wait_for(state='visible', timeout=timeout_ms)
+                page.wait_for_timeout(100)
+                locator.screenshot(path=str(target), type='png')
                 screenshot_paths.append(target)
             context.close()
             browser.close()
     except Exception as exc:  # pragma: no cover
-        if allow_fallback:
+        if allow_fallback_preview:
             fallback = _render_fallback_pngs(slides, out_dir, int(viewport_width), int(viewport_height))
             if fallback.get('success'):
-                fallback['warnings'] = [f'Playwright rendering failed: {exc}'] + (fallback.get('warnings') or [])
+                fallback['success'] = False
+                fallback['warnings'] = [
+                    f'Playwright rendering failed: {exc}',
+                    'Fallback preview is for debugging only and cannot be exported as formal visual PPTX.',
+                ] + (fallback.get('warnings') or [])
+                fallback['error_message'] = f'html screenshot rendering failed: {exc}'
+                fallback['install_hint'] = 'python -m playwright install chromium'
                 return fallback
         return _missing_playwright_result(f'html screenshot rendering failed: {exc}', slides)
 
@@ -323,4 +363,8 @@ def render_html_deck_screenshots(
         'warnings': warnings,
         'error_message': '',
         'fallback_used': False,
+        'is_real_browser_render': True,
+        'can_export_visual_pptx': True,
+        'render_quality': 'real_browser',
+        'install_hint': '',
     }
