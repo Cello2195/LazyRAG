@@ -1,0 +1,836 @@
+import lazyllm
+import builtins
+from lazyllm import config
+from lazyllm.common import LazyLLMRegisterMetaClass, package, kwargs, arguments, bind
+from lazyllm.common import ReadOnlyWrapper, LOG, globals, locals, _get_callsite
+from lazyllm.common import _register_trim_module, HandledException, _change_exception_type
+from lazyllm.common import SessionConfigableBase
+from lazyllm.common.bind import _MetaBind
+from functools import partial
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
+from enum import Enum
+from asyncio import events
+import types
+import inspect
+import threading
+import traceback
+import sys
+import os
+from typing import Union, List, Optional
+import concurrent.futures
+from collections import deque
+import uuid
+from ..hook import LazyLLMHook, execution_with_hooks, register_hooks, resolve_builtin_hooks
+from ..tracing.collect.output_attrs import push_ifs_matched_attrs, push_switch_matched_attrs
+from itertools import repeat
+
+
+class FlowException(HandledException):
+    pass
+
+
+class _FuncWrap(object):
+    def __init__(self, f):
+        self._f = f._f if isinstance(f, _FuncWrap) else f
+        self._hooks = []
+        register_hooks(self, resolve_builtin_hooks(self))
+
+    @execution_with_hooks
+    def __call__(self, *args, **kw): return self._f(*args, **kw)
+
+    def __repr__(self):
+        # TODO: specify lambda/staticmethod/classmethod/instancemethod
+        # TODO: add registry message
+        return lazyllm.make_repr('Function', type(self._f).__name__, name=(
+            self._f if _is_function(self._f) else self._f.__class__).__name__.strip('<>'))
+
+    def __getattr__(self, __key):
+        if __key != '_f':
+            return getattr(self._f, __key)
+        return super(__class__, self).__getattr__(__key)
+
+
+_oldins = isinstance
+def new_ins(obj, cls):
+    if _oldins(obj, _FuncWrap) and os.getenv('LAZYLLM_ON_CLOUDPICKLE', None) != 'ON':
+        return True if (cls is _FuncWrap or (_oldins(cls, (tuple, list)) and _FuncWrap in cls)) else _oldins(obj._f, cls)
+    return _oldins(obj, cls)
+
+builtins.isinstance = new_ins
+
+def _is_function(f):
+    return isinstance(f, (types.BuiltinFunctionType, types.FunctionType,
+                          types.BuiltinMethodType, types.MethodType, types.LambdaType))
+
+
+_thread_local = threading.local()
+_async_var = ContextVar('lazyllm.flow_stack')
+
+def _get_flow_stack():
+    if events._get_running_loop() is not None:
+        stack = _async_var.get(None)
+        if stack is None:
+            stack = []
+            _async_var.set(stack)
+        return stack
+    else:
+        stack = getattr(_thread_local, 'stack', None)
+        if stack is None:
+            _thread_local.stack = stack = []
+        return stack
+
+
+_register_trim_module({'lazyllm.flow.flow': ['__call__']}, continuous=True)
+_register_trim_module({'lazyllm.flow.flow': ['_run', 'invoke'], 'lazyllm.common.bind': ['__call__']})
+
+class FlowBase(SessionConfigableBase, metaclass=_MetaBind):
+    def __init__(self, *items, item_names=None, auto_capture=False, id: Optional[str] = None, name: Optional[str] = None,
+                 group_id: Optional[str] = None) -> None:
+        super().__init__(id=id, name=name, group_id=group_id)
+        self._father = None
+        self._items, self._item_names, self._item_ids, self._item_pos = [], [], [], []
+        self._auto_capture = auto_capture
+        self._capture = True
+        self._curr_frame = None
+        self._find_user_instantiation_frame()
+
+        for k, v in zip(item_names if item_names else repeat(None), items):
+            self._add(k, v)
+
+        self._capture = False
+        self._auto_registered = False
+
+    def __post_init__(self): pass
+
+    @property
+    def _flow_id(self):
+        return self._config_id
+
+    def _make_step_item(self, v):
+        if isinstance(v, type):
+            return v()
+        if isinstance(v, bind) and v._wraps_plain_callable():
+            register_hooks(v, resolve_builtin_hooks(v))
+            return v
+        if _is_function(v) or v in self._items:
+            return _FuncWrap(v)
+        return v
+
+    def _add(self, k, v):
+        assert self._capture, f'_add can only be used in `{self.__class__}.__init__` or `with {self.__class__}()`'
+        item = self._make_step_item(v)
+        self._items.append(item)
+        self._item_ids.append(k or str(uuid.uuid4().hex))
+        self._item_pos.append(_get_callsite(depth=3))
+        if isinstance(item, FlowBase): item._father = self
+        if k:
+            assert k not in self._item_names, f'Duplicated names {k}'
+            self._item_names.append(k)
+        if self._curr_frame and isinstance(item, FlowBase) and k and k not in self._curr_frame.f_locals:
+            self._curr_frame.f_locals[k] = item  # make sense only when locals is globals
+
+    def __enter__(self, __frame=None):
+        assert len(self._items) == 0, f'Cannot init {self.__class__} with items if you want to use it by context.'
+        self._curr_frame = __frame if __frame else inspect.currentframe().f_back
+        if self._auto_capture:
+            self._frame_keys = list(self._curr_frame.f_locals.keys())
+        self._capture = True
+        _get_flow_stack().append(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._auto_capture:
+            locals = self._curr_frame.f_locals.copy()
+            for var, val in locals.items():
+                if var != 'self' and var not in self._frame_keys and (
+                        (val._f if isinstance(val, bind) else val) is not self):
+                    self._add(var, val)
+        assert _get_flow_stack().pop() == self, 'Do not operate FLow.stack manually!'
+        self._capture = False
+        self._curr_frame = None
+        self.__post_init__()
+        return False
+
+    def __iter__(self):
+        # used to support `with pipeline() as (a.b, b):`
+        return iter([self, self])
+
+    def _find_user_instantiation_frame(self):
+        try:
+            for fm in inspect.stack():
+                if fm.frame.f_globals.get('__name__', '').startswith('lazyllm.flow') or fm.filename.startswith('<'):
+                    continue
+                self._defined_file = os.path.abspath(fm.frame.f_code.co_filename)
+                self._defined_func = fm.frame.f_code.co_name
+                self._defined_pos = f'"file: {self._defined_file}", line {fm.frame.f_lineno}({self._defined_func})'
+                break
+        except Exception:
+            self._defined_file, self._defined_pos, self._defined_func = None, None, None
+
+    def _defined_at_the_same_scope(self, other: 'FlowBase'):
+        return self._defined_file == other._defined_file and self._defined_func == other._defined_func
+
+    def __setattr__(self, name: str, value):
+        if '_capture' in self.__dict__ and self._capture and not name.startswith('_'):
+            if hasattr(value, '_module_id') and hasattr(value, 'name') and value.name is None:
+                value.name = name
+            if len(_get_flow_stack()) > 1 and not self._auto_registered:
+                super(__class__, self).__setattr__('_auto_registered', True)
+                frame_locals = self._curr_frame.f_locals.copy()
+                for key, item in frame_locals.items():
+                    if item == self and (parent := _get_flow_stack()[-2]) != item:
+                        if key not in parent._item_names and parent._defined_at_the_same_scope(self):
+                            parent._add(key, self)
+                        break
+            assert name not in self._item_names, f'Duplicated name: {name}'
+            self._add(name, value)
+        elif name in getattr(self, '_item_names', ()):
+            raise RuntimeError(f'The setting of {self.__class__} elements must be done within the `with` statement.')
+        else:
+            super(__class__, self).__setattr__(name, value)
+
+    def __getattr__(self, name):
+        if '_item_names' in self.__dict__ and name in self._item_names:
+            return self._items[self._item_names.index(name)]
+        raise AttributeError(f'{self.__class__} object has no attribute {name}')
+
+    def id(self, module=None):
+        if isinstance(module, str): return module
+        return self._item_ids[self._items.index(module)] if module else self._flow_id
+
+    @property
+    def is_root(self):
+        return self._father is None
+
+    @property
+    def ancestor(self):
+        if self.is_root: return self
+        return self._father.ancestor
+
+    def for_each(self, filter, action):
+        for item in self._items:
+            if isinstance(item, FlowBase):
+                item.for_each(filter, action)
+            elif filter(item):
+                action(item)
+
+def _bind_enter(self):
+    assert isinstance(self._f, FlowBase)
+    self._f.__enter__() if type(self._f) is bind else self._f.__enter__(inspect.currentframe().f_back)
+    return self
+
+def _bind_exit(self, exc_type, exc_val, exc_tb):
+    return (self._f.__exit__(exc_type, exc_val, exc_tb)
+            if type(self._f) is bind else self._f.__exit__(exc_type, exc_val, exc_tb))
+
+bind.__enter__ = _bind_enter
+bind.__exit__ = _bind_exit
+
+
+# TODO(wangzhihong): support workflow launcher.
+# Disable item launchers if launcher is already set in workflow.
+class LazyLLMFlowsBase(FlowBase, metaclass=LazyLLMRegisterMetaClass):
+    def __init__(self, *args, post_action=None, auto_capture=False, id: Optional[str] = None,
+                 name: Optional[str] = None, group_id: Optional[str] = None, **kw):
+        assert len(args) == 0 or len(kw) == 0, f'Cannot provide args `{args}` and kwargs `{kw}` at the same time'
+        if len(args) > 0 and isinstance(args[0], (tuple, list)):
+            assert len(args) == 1, 'args should be list of callable functions'
+            args = args[0]
+        args = list(args) + [v() if isinstance(v, type) else v for v in kw.values()]
+        super(__class__, self).__init__(*args, item_names=list(kw.keys()), auto_capture=auto_capture,
+                                        id=id, name=name, group_id=group_id)
+        self.post_action = post_action() if isinstance(post_action, type) else post_action
+        self._sync = False
+        self._hooks = []
+        register_hooks(self, resolve_builtin_hooks(self))
+
+    @execution_with_hooks
+    def __call__(self, *args, **kw):
+        with globals.stack_enter(self.identities):
+            output = self._run(args[0] if len(args) == 1 else package(args), **kw)
+        if self.post_action is not None:
+            self.invoke(self.post_action, output)
+        if self._sync:
+            self.wait()
+        return self._post_process(output)
+
+    def register_hook(self, hook_type: LazyLLMHook):
+        if not (isinstance(hook_type, LazyLLMHook)
+                or (isinstance(hook_type, type) and issubclass(hook_type, LazyLLMHook))):
+            raise TypeError(f'Invalid hook type: {type(hook_type)}, '
+                            'must be subclass or instance of LazyLLMHook')
+        if hook_type not in self._hooks:
+            self._hooks.append(hook_type)
+
+    def unregister_hook(self, hook_type: LazyLLMHook):
+        if hook_type in self._hooks:
+            self._hooks.remove(hook_type)
+
+    def clear_hooks(self):
+        self._hooks = []
+
+    def _post_process(self, output):
+        return output
+
+    def _run(self, __input, **kw):
+        raise NotImplementedError
+
+    def start(self, *args, **kw):
+        lazyllm.LOG.warning('start is depreciated, please use flow as a function instead')
+        return self(*args, **kw)
+
+    def set_sync(self, sync=True):
+        self._sync = sync
+        return self
+
+    def __repr__(self):
+        subs = [repr(it) for it in self._items]
+        if self.post_action is not None:
+            subs.append(lazyllm.make_repr('Flow', 'PostAction', subs=[self.post_action.__repr__()]))
+        return lazyllm.make_repr('Flow', self.__class__.__name__, subs=subs, items=self._item_names)
+
+    def wait(self):
+        def filter(x):
+            return hasattr(x, 'job') and isinstance(x.job, ReadOnlyWrapper) and not x.job.isNone()
+        self.for_each(filter, lambda x: x.job.wait())
+        return self
+
+    # bind_args: dict(input=input, args=dict(key=value))
+    def invoke(self, it, __input, *, bind_args_source=None, **kw):
+        if isinstance(it, bind):
+            if isinstance(self, Pipeline):
+                it._args = [self.output(a) if a in self._items else a for a in it._args]
+                it._kw = {k: self.output(v) if v in self._items else v for k, v in it._kw.items()}
+            kw['_bind_args_source'] = bind_args_source
+        try:
+            if not isinstance(it, LazyLLMFlowsBase) and isinstance(__input, (package, kwargs)):
+                return it(*__input, **kw) if isinstance(__input, package) else it(**__input, **kw)
+            else:
+                return it(__input, **kw)
+        except HandledException as e: raise e
+        except Exception as e:
+            try:
+                pos = self._item_pos[self._items.index(it)]
+            except Exception:
+                pos = None
+            if '_bind_args_source' in kw: kw = (kw.get('_bind_args_source') or {}).pop('kwargs', None)
+            err_msg = (f'Flow defined at {self._defined_pos or "Unknown position"} encountered an error:\n'
+                       f'invoking `{it}`({pos or "Position not found"}) with input `{__input}` and kw `{kw}` failed. '
+                       + 'Details: `{type}: {value}`'.format(type=type(e).__name__, value=str(e).replace('\n', '\\n')))
+            LOG.error(err_msg)
+            LOG.debug(f'Error type: {type(e).__name__}, Error message: {str(e)}\n'
+                      f'Traceback: {"".join(traceback.format_exception(*sys.exc_info()))}')
+            raise _change_exception_type(e, FlowException) from None
+
+    def bind(self, *args, **kw):
+        return bind(self, *args, **kw)
+
+
+_async_save_flag = ContextVar('lazyllm.pipeline.save_flag')
+
+def _get_current_save_flag():
+    return (_async_save_flag.get(None) if events._get_running_loop() is not None else
+            getattr(_thread_local, 'save_flag', None))
+
+def _set_current_save_flag(flag):
+    if events._get_running_loop() is not None:
+        _async_save_flag.set(flag)
+    else:
+        _thread_local.save_flag = flag
+
+@contextmanager
+def save_pipeline_result(flag: bool = True):
+    old_flag = _get_current_save_flag()
+    try:
+        _set_current_save_flag(flag)
+        yield
+    finally:
+        _set_current_save_flag(old_flag)
+
+# input -> module1 -> module2 -> ... -> moduleN -> output
+#                                               \> post-action
+# TODO(wangzhihong): support mult-input and output
+class Pipeline(LazyLLMFlowsBase):
+    def __init__(self, *args, post_action=None, auto_capture=False, save_result=None, **kw):
+        super().__init__(*args, post_action=post_action, auto_capture=auto_capture, **kw)
+        self._save_flow_result = save_result if save_result is not None else (
+            _get_current_save_flag() or config['save_flow_result'])
+
+    @property
+    def save_flow_result(self): return self._save_flow_result
+
+    @save_flow_result.setter
+    def save_flow_result(self, value): self._save_flow_result = value
+
+    @property
+    def _loop_count(self):
+        return getattr(self, '_loop_count_var', 1)
+
+    @_loop_count.setter
+    def _loop_count(self, count):
+        assert count > 1, 'At least one loop is required!'
+        self._loop_count_var = count
+
+    @property
+    def _stop_condition(self):
+        return getattr(self, '_stop_condition_var', None)
+
+    @_stop_condition.setter
+    def _stop_condition(self, cond):
+        self._stop_condition_var = cond
+
+    @property
+    def _judge_on_full_input(self):
+        return getattr(self, '_judge_on_full_input_var', True)
+
+    @_judge_on_full_input.setter
+    def _judge_on_full_input(self, judge):
+        self._judge_on_full_input_var = judge
+
+    @property
+    def input(self): return bind.Args(self.id())
+    @property
+    def kwargs(self): return bind.Args(self.id(), 'kwargs')
+    def output(self, module, unpack=False): return bind.Args(self.id(), self.id(module), unpack=unpack)
+
+    def _run(self, __input, **kw):
+        output = __input
+        bind_args_source = dict(source=self.id(), input=output, kwargs=kw.copy())
+        bind_flag = self.save_flow_result if (flag := _get_current_save_flag()) is None else flag
+        if bind_flag:
+            lazyllm.LOG.debug(f'add {self.id()} to bind_args')
+            locals['bind_args'][self.id()] = bind_args_source
+        _iteration_idx = -1
+        for _iteration_idx in range(self._loop_count):
+            for it in self._items:
+                output = self.invoke(it, output, bind_args_source=bind_args_source, **kw)
+                kw.clear()
+                bind_args_source[self.id(it)] = output
+            exp = output
+            if not self._judge_on_full_input:
+                assert isinstance(output, tuple) and len(output) >= 2
+                exp = output[0]
+                output = output[1:]
+            if callable(self._stop_condition) and self.invoke(self._stop_condition, exp): break
+        if isinstance(self, Loop) and isinstance(tr := globals.get('trace'), dict):
+            tr.setdefault('actual_iterations', {})[self.id()] = _iteration_idx + 1
+        if bind_flag:
+            lazyllm.LOG.debug(f'delete {self.id()} form bind_args')
+            locals['bind_args'].pop(self.id(), None)
+        return output
+
+
+config.add('save_flow_result', bool, False, 'SAVE_FLOW_RESULT',
+           description='Whether to save the intermediate result of the pipeline.')
+
+
+_barr = threading.local()
+def barrier(args):
+    if _barr.impl: _barr.impl.wait()
+    return args
+
+
+config.add('parallel_multiprocessing', bool, False, 'PARALLEL_MULTIPROCESSING',
+           description='Whether to use multiprocessing for parallel execution, if not, default to use threading.')
+
+
+#        /> module11 -> ... -> module1N -> out1 \
+#  input -> module21 -> ... -> module2N -> out2 -> (out1, out2, out3)
+#        \> module31 -> ... -> module3N -> out3 /
+class Parallel(LazyLLMFlowsBase):
+
+    @staticmethod
+    def _worker(func, barrier, sid, local_data, *args, global_data=None, **kw):
+        lazyllm.globals._init_sid(sid)
+        if global_data: lazyllm.globals._update(global_data)
+        lazyllm.locals._init_sid()
+        lazyllm.locals._update({k: v.copy() for k, v in local_data.items()})
+        _barr.impl = barrier
+        r = func(*args, **kw)
+        lazyllm.locals.clear()
+        return r
+
+    class PostProcessType(Enum):
+        NONE = 0
+        DICT = 1
+        TUPLE = 2
+        LIST = 3
+        SUM = 4
+        JOIN = 5
+
+    def __init__(self, *args, _scatter: bool = False, _concurrent: Union[bool, int] = True,
+                 multiprocessing: bool = False, auto_capture: bool = False, **kw):
+        super().__init__(*args, **kw, auto_capture=auto_capture)
+        self._post_process_type = Parallel.PostProcessType.NONE
+        self._post_process_args = None
+        self._multiprocessing = multiprocessing or config['parallel_multiprocessing']
+        self._concurrent = 0 if not _concurrent else 5 if isinstance(_concurrent, bool) else _concurrent
+        self._scatter = _scatter
+
+    @staticmethod
+    def _set_status(self, type, args=None):
+        assert self._post_process_type is Parallel.PostProcessType.NONE, 'Cannor set post process twice'
+        self._post_process_type = type
+        self._post_process_args = args
+        return self
+
+    asdict = property(partial(_set_status, type=PostProcessType.DICT))
+    astuple = property(partial(_set_status, type=PostProcessType.TUPLE))
+    aslist = property(partial(_set_status, type=PostProcessType.LIST))
+    sum = property(partial(_set_status, type=PostProcessType.SUM))
+
+    def join(self, string=''):
+        assert isinstance(string, str), 'argument of join shoule be str'
+        return Parallel._set_status(self, type=Parallel.PostProcessType.JOIN, args=string)
+
+    @classmethod
+    def sequential(cls, *args, **kw):
+        return cls(*args, _concurrent=False, **kw)
+
+    # items = [a, b, c, d, e], skip_items = [1, 3]/['b', 'd'] -> items = [a, c, e]
+    # input = [0, 1, 2, 3, 4] -> [0, 2, 4]
+    # input = [0, 2, 4] -> [0, 2, 4]
+    # input = dict(a=0, b=1, c=2, d=3, e=4) -> [0, 2, 4]
+    # input = dict(a=0, c=2, e=4) -> [0, 2, 4]
+    def _split_input(self, inputs, items, _kept_idx):
+        if self._scatter:
+            if isinstance(inputs, dict):
+                inputs = package(inputs[n] for n in ([n for i, n in enumerate(self._item_names or repeat(None))
+                                                     if i in _kept_idx] if _kept_idx else self._item_names))
+            else:
+                if isinstance(inputs, package) and len(inputs) == 1: inputs = inputs[0]
+                assert isinstance(inputs, (tuple, list)), (
+                    f'Only tuple and list input can be split automatically, your input is {inputs} <{type(inputs)}>')
+                if _kept_idx and len(inputs) != len(_kept_idx):
+                    assert len(inputs) == len(self._items)
+                    inputs = [inp for i, inp in enumerate(inputs) if i in _kept_idx]
+        else:
+            inputs = [inputs] * len(items)
+        return inputs
+
+    def _parallel_resolve_items_and_inputs(self, __input, __items, _kept_items, _skip_items):
+        if (items := __items) is None:
+            items = self._items
+        if _kept_items:
+            if _skip_items:
+                raise RuntimeError('Cannot provide `_kept_items` and `_skip_items` at the same time!')
+            _kept_idx = [i for i, (_, n) in enumerate(zip(self._items, self._item_names or repeat(None)))
+                         if i in _kept_items or n in _kept_items]
+        else:
+            _kept_idx = ([i for i, (_, n) in enumerate(zip(self._items, self._item_names or repeat(None)))
+                          if i not in _skip_items and n not in _skip_items] if _skip_items else None)
+        if _kept_idx:
+            items = [it for i, it in enumerate(self._items) if i in _kept_idx]
+        inputs = self._split_input(__input, items, _kept_idx)
+        return items, inputs
+
+    def _parallel_execute_concurrent(self, items, inputs, **kw):
+        if self._multiprocessing:
+            barrier, executor = None, lazyllm.ProcessPoolExecutor
+            kw['global_data'] = lazyllm.globals._data
+        else:
+            barrier, executor = threading.Barrier(len(items)), concurrent.futures.ThreadPoolExecutor
+
+        with executor(max_workers=self._concurrent) as e:
+            # Thread workers need the parent's contextvars (OTel current span, tracing ContextVars,
+            # etc.); ProcessPoolExecutor cannot use copy_context the same way (separate interpreter).
+            futures = []
+            for it, inp in zip(items, inputs):
+                worker_call = partial(self._worker, self.invoke, barrier, lazyllm.globals._sid,
+                                      lazyllm.locals._data, it, inp, **kw)
+                if self._multiprocessing:
+                    futures.append(e.submit(worker_call))
+                else:
+                    futures.append(e.submit(copy_context().run, worker_call))
+            if (not_done := concurrent.futures.wait(futures).not_done):
+                error_msgs = []
+                for future in not_done:
+                    if (exc := future.exception()) is not None:
+                        if (tb := getattr(future, '_traceback', None)):
+                            tb_str = ''.join(traceback.format_exception(type(exc), exc, tb))
+                        else:
+                            tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                        error_msgs.append(f'Future: {future}\n{tb_str}')
+                    else:
+                        error_msgs.append(f'Future: {future} not complete without exception。')
+                raise RuntimeError('Parallel execute failed!\n' + '\n'.join(error_msgs))
+            return package([future.result() for future in futures])
+
+    def _run(self, __input, __items=None, *, _kept_items: Optional[Union[int, str, List[Union[int, str]]]] = None,
+             _skip_items: Optional[Union[int, str, List[Union[int, str]]]] = None, **kw):
+        items, inputs = self._parallel_resolve_items_and_inputs(__input, __items, _kept_items, _skip_items)
+        if self._concurrent:
+            return self._parallel_execute_concurrent(items, inputs, **kw)
+        return package(self.invoke(it, inp, **kw) for it, inp in zip(items, inputs))
+
+    def _post_process(self, output):
+        if self._post_process_type == Parallel.PostProcessType.DICT:
+            assert self._item_names, 'Item name should be set when you want to return dict.'
+            output = {k: v for k, v in zip(self._item_names, output)}
+        elif self._post_process_type == Parallel.PostProcessType.TUPLE:
+            output = tuple(output)
+        elif self._post_process_type == Parallel.PostProcessType.LIST:
+            output = list(output)
+        elif self._post_process_type == Parallel.PostProcessType.SUM:
+            output = ''.join([str(i) for i in output]) if isinstance(output[0], str) else sum(output, type(output[0])())
+        elif self._post_process_type == Parallel.PostProcessType.JOIN:
+            output = self._post_process_args.join([str(i) for i in output])
+        return output
+
+
+#                  /> in1 -> module11 -> ... -> module1N -> out1 \
+#  (in1, in2, in3) -> in2 -> module21 -> ... -> module2N -> out2 -> (out1, out2, out3)
+#                  \> in3 -> module31 -> ... -> module3N -> out3 /
+class Diverter(Parallel):
+    def __init__(self, *args, _concurrent: Union[bool, int] = True, auto_capture: bool = False, **kw):
+        super().__init__(*args, _scatter=True, _concurrent=_concurrent, auto_capture=auto_capture, **kw)
+
+
+#                  /> in1 \                            /> out1 \
+#  (in1, in2, in3) -> in2 -> module1 -> ... -> moduleN -> out2 -> (out1, out2, out3)
+#                  \> in3 /                            \> out3 /
+# Attention: Cannot be used in async tasks, ie: training and deploy
+# TODO: add check for async tasks
+class Warp(Parallel):
+    def __init__(self, *args, _concurrent: Union[bool, int] = True, auto_capture: bool = False, **kw):
+        super().__init__(*args, _scatter=True, _concurrent=_concurrent, auto_capture=auto_capture, **kw)
+        if len(self._items) > 1: self._items = [Pipeline(*self._items)]
+
+    def __post_init__(self):
+        if len(self._items) > 1: self._items = [Pipeline(*self._items)]
+
+    def _run(self, __input, **kw):
+        assert 1 == len(self._items), 'Only one function is enabled in warp'
+        assert '_skip_items' not in kw, '`skip_items` is not allowed in warp'
+        assert '_kept_items' not in kw, '`_kept_items` is not allowed in warp'
+        return super(__class__, self)._run(__input, self._items * len(package(__input)), **kw)
+
+    @property
+    def asdict(self): raise NotImplementedError
+
+# switch(conversion(input)):
+#     case cond1: input -> module11 -> ... -> module1N -> out; break
+#     case cond2: input -> module21 -> ... -> module2N -> out; break
+#     case cond3: input -> module31 -> ... -> module3N -> out; break
+class Switch(LazyLLMFlowsBase):
+    # Switch({cond1: M1, cond2: M2, ..., condN: MN})
+    # Switch(cond1, M1, cond2, M2, ..., condN, MN)
+    def __init__(self, *args, conversion=None, post_action=None, judge_on_full_input=True):
+        if len(args) == 1 and isinstance(args[0], dict):
+            self.conds, items = list(args[0].keys()), list(args[0].values())
+        else:
+            self.conds, items = list(args[0::2]), args[1::2]
+        super().__init__(*items, post_action=post_action)
+        self._judge_on_full_input = judge_on_full_input
+        self._set_conversion(conversion)
+
+    def _set_conversion(self, conversion):
+        self._conversion = conversion
+
+    def _run(self, __input, **kw):
+        exp = __input
+        if not self._judge_on_full_input:
+            assert isinstance(__input, tuple) and len(__input) >= 2
+            exp = __input[0]
+            __input = __input[1] if len(__input) == 2 else __input[1:]
+
+        if self._conversion:
+            exp = self._conversion(*exp) if isinstance(exp, package) else self._conversion(exp)
+
+        for idx, cond in enumerate(self.conds):
+            if (callable(cond) and self.invoke(cond, exp) is True) or (exp == cond) or (
+                    exp == package((cond,))) or cond == 'default':
+                alias = self._item_names[idx] if self._item_names and idx < len(self._item_names) else None
+                actual = getattr(self._items[idx], '__name__', None) or type(self._items[idx]).__name__
+                branch = f'{alias} -> {actual}' if alias and alias != actual else actual
+                matched = {'index': idx, 'condition': str(cond), 'branch': branch}
+                push_switch_matched_attrs(matched)
+                return self.invoke(self._items[idx], __input, **kw)
+
+    class Case:
+        def __init__(self, m) -> None: self._m = m
+        def __call__(self, cond, func): self._m._add_case(cond, func)
+
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                if key.start:
+                    if (callable(key.step) and key.stop is None):
+                        return self._m._add_case(key.start, key.step)
+                    elif (key.step is None and callable(key.stop)):
+                        return self._m._add_case(key.start, key.stop)
+            elif isinstance(key, tuple) and len(key) == 2 and callable(key[1]):
+                return self._m._add_case(key[0], key[1])
+            raise RuntimeError(f'Only [cond::func], [cond:func] or [cond, func] is allowed in case, but you give {key}')
+
+    @property
+    def case(self): return Switch.Case(self)
+
+    def _add_case(self, case, func):
+        self.conds.append(case)
+        self._add(None, func)
+
+
+# result = cond(input) ? tpath(input) : fpath(input)
+class IFS(LazyLLMFlowsBase):
+    def __init__(self, cond, tpath, fpath, post_action=None):
+        super().__init__(cond, tpath, fpath, post_action=post_action)
+
+    def _run(self, __input, **kw):
+        cond, tpath, fpath = self._items
+        try:
+            flag = cond()
+        except Exception:
+            flag = cond if isinstance(cond, bool) else self.invoke(cond, __input, **kw)
+        chosen = tpath if flag else fpath
+        branch_label = 'true_path' if flag else 'false_path'
+        name = getattr(chosen, '__name__', None) or type(chosen).__name__
+        matched = {'branch': branch_label, 'chosen_node': name, 'condition_result': bool(flag)}
+        push_ifs_matched_attrs(matched)
+        return self.invoke(chosen, __input, **kw)
+
+
+#  in(out) -> module1 -> ... -> moduleN -> exp, out -> out
+#      ⬆----------------------------------------|
+class Loop(Pipeline):
+    def __init__(self, *item, stop_condition=None, count=sys.maxsize, post_action=None,
+                 auto_capture=False, judge_on_full_input=True, **kw):
+        super().__init__(*item, post_action=post_action, auto_capture=auto_capture, **kw)
+        assert callable(stop_condition) or stop_condition is None
+        self._judge_on_full_input = judge_on_full_input
+        self._stop_condition = stop_condition
+        self._loop_count = count
+
+
+class Graph(LazyLLMFlowsBase):
+
+    start_node_name, end_node_name = '__start__', '__end__'
+
+    class Node:
+        def __init__(self, func, name, arg_names=None):
+            self.func, self.name, self.arg_names = func, name, None
+            self.inputs, self.outputs = dict(), []
+
+        def __repr__(self): return lazyllm.make_repr('Flow', 'Node', name=self.name)
+
+    def __init__(self, *, post_action=None, auto_capture=False, **kw):
+        super(__class__, self).__init__(post_action=post_action, auto_capture=auto_capture, **kw)
+
+    def __post_init__(self):
+        self._nodes = {n: Graph.Node(f, n) for f, n in zip(self._items, self._item_names)}
+        self._nodes[Graph.start_node_name] = Graph.Node(None, Graph.start_node_name)
+        self._nodes[Graph.end_node_name] = Graph.Node(lazyllm.Identity(), Graph.end_node_name)
+        self._in_degree = {node: 0 for node in self._nodes.values()}
+        self._out_degree = {node: 0 for node in self._nodes.values()}
+        self._sorted_nodes = None
+        self._constants = []
+
+    def set_node_arg_name(self, arg_names):
+        for node_name, name in zip(self._item_names, arg_names):
+            self._nodes[node_name].arg_names = name
+
+    @property
+    def start_node(self): return self._nodes[Graph.start_node_name]
+
+    @property
+    def end_node(self): return self._nodes[Graph.end_node_name]
+
+    def add_edge(self, from_node, to_node, formatter=None):
+        if isinstance(from_node, (tuple, list)):
+            return [self.add_edge(f, to_node, formatter) for f in from_node]
+        if isinstance(to_node, (tuple, list)):
+            return [self.add_edge(from_node, t, formatter) for t in to_node]
+
+        if isinstance(from_node, str): from_node = self._nodes[from_node]
+        if isinstance(to_node, str): to_node = self._nodes[to_node]
+        from_node.outputs.append(to_node)
+        assert from_node.name not in to_node.inputs, f'Duplicate edges from {from_node.name} to {to_node.name}'
+        to_node.inputs[from_node.name] = formatter
+        self._in_degree[to_node] += 1
+        self._out_degree[from_node] += 1
+
+    def add_const_edge(self, constant, to_node):
+        if isinstance(to_node, (tuple, list)):
+            return [self.add_const_edge(constant, t) for t in to_node]
+        if isinstance(to_node, str): to_node = self._nodes[to_node]
+        to_node.inputs[f'_lazyllm_constant_{len(self._constants)}'] = None
+        self._constants.append(constant)
+
+    def topological_sort(self):
+        in_degree = self._in_degree.copy()
+        queue = deque([node for node in self._nodes.values() if in_degree[node] == 0])
+        sorted_nodes: List[Graph.Node] = []
+
+        while queue:
+            node = queue.popleft()
+            sorted_nodes.append(node)
+            for output_node in node.outputs:
+                in_degree[output_node] -= 1
+                if in_degree[output_node] == 0:
+                    queue.append(output_node)
+
+        if len(sorted_nodes) != len(self._nodes):
+            raise ValueError('Graph has a cycle')
+
+        return [n for n in sorted_nodes if (self._in_degree[n] > 0 or self._out_degree[n] > 0)]
+
+    def _get_input(self, name, node, intermediate_results, futures):
+        if name.startswith('_lazyllm_constant_'):
+            return self._constants[int(name.removeprefix('_lazyllm_constant_'))]
+        if name not in intermediate_results['values']:
+            r = futures[name].result()
+            with intermediate_results['lock']:
+                if name not in intermediate_results['values']:
+                    intermediate_results['values'][name] = r
+        r = intermediate_results['values'][name]
+        if isinstance(r, Exception): raise r
+        if node.inputs[name]:
+            if isinstance(r, arguments) and not ((len(r.args) == 0) ^ (len(r.kw) == 0)):
+                raise RuntimeError('Only one of args and kwargs can be given with formatter.')
+            r = node.inputs[name]((r.args or r.kw) if isinstance(r, arguments) else r)
+        return r
+
+    def compute_node(self, sid, node, intermediate_results, futures):
+        globals._init_sid(sid)
+
+        kw = {}
+        if len(node.inputs) == 1:
+            input = self._get_input(list(node.inputs.keys())[0], node, intermediate_results, futures)
+        else:
+            # TODO(wangzhihong): add complex rules: mixture of package / support kwargs / ...
+            inputs = package(self._get_input(input, node, intermediate_results, futures)
+                             for input in node.inputs.keys())
+            input = arguments()
+            for inp in inputs:
+                input.append(inp)
+
+        if isinstance(input, arguments):
+            kw = input.kw
+            input = input.args
+
+        if node.arg_names:
+            if not isinstance(input, (list, tuple, package)): input = [input]
+            kw.update({name: value for name, value in zip(node.arg_names, input)})
+            input = package()
+
+        return self.invoke(node.func, input, **kw)
+
+    def _run(self, __input, **kw):
+        if not self._sorted_nodes: self._sorted_nodes = self.topological_sort()
+        intermediate_results = dict(lock=threading.Lock(), values={})
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = {}
+
+            for node in self._sorted_nodes:
+                if node.name == '__start__':
+                    intermediate_results['values'][node.name] = (
+                        arguments(__input, kw) if (__input and kw) else (kw or __input))
+                else:
+                    future = executor.submit(
+                        copy_context().run,
+                        partial(self.compute_node, globals._sid, node, intermediate_results, futures),
+                    )
+                    futures[node.name] = future
+
+        return futures[Graph.end_node_name].result()

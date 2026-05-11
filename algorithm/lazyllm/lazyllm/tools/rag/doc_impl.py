@@ -1,0 +1,673 @@
+import os
+import hashlib
+import json
+import re
+from enum import Enum
+from pydantic import BaseModel
+from typing import Callable, Dict, List, Optional, Set, Union, Tuple, Any, Type
+from lazyllm import LOG, once_wrapper, config
+from lazyllm.module import LLMBase
+from .transform import (NodeTransform, SentenceSplitter,
+                        TransformArgs, TransformArgs as TArgs, _transmap)
+from .index_base import IndexBase
+from .store import (LAZY_ROOT_NAME, LAZY_IMAGE_GROUP, LazyLLMStoreBase)
+from .store.store_base import DEFAULT_KB_ID
+from .store.document_store import _DocumentStore
+from .doc_node import DocNode
+from .data_loaders import DirectoryReader
+from .utils import RAG_DEFAULT_GROUP_NAME, gen_docid, is_sparse, _get_default_db_config
+from .global_metadata import GlobalMetadataDesc, RAG_DOC_ID, RAG_KB_ID
+from .data_type import DataType
+from .parsing_service import _Processor, DocumentProcessor
+from .embed_wrapper import _EmbedWrapper
+from .doc_to_db import SchemaExtractor
+from dataclasses import dataclass
+
+_VERSION_RE = re.compile(
+    r'^([0-9]+!)?[0-9]+(\.[0-9]+)*([-_\.]?(a|b|rc|alpha|beta|preview)[0-9]*)?(\.post[0-9]+)?(\.dev[0-9]+)?$',
+    re.IGNORECASE,
+)
+
+
+def _callable_sig_for_doc_impl(t) -> str:
+    import inspect as _inspect
+    qualname = getattr(t, '__qualname__', None)
+    module = getattr(t, '__module__', None)
+    if qualname and '<lambda>' not in qualname:
+        return f'{module}.{qualname}' if module else qualname
+    try:
+        src = _inspect.getsource(t).strip()
+        return '__lambda__::' + hashlib.sha256(src.encode()).hexdigest()[:16]
+    except (OSError, TypeError):
+        return repr(t)
+
+
+def _compute_node_group_signature(name: str, transform, parent_sig: str, ref_sig: str,
+                                  group_type: 'NodeGroupType') -> str:
+    def _elem_sig(t) -> str:
+        if isinstance(t, TransformArgs):
+            return t.signature()
+        if isinstance(t, str):
+            cls = _transmap.get(t.lower())
+            return cls.__name__ if cls else t
+        if callable(t):
+            return _callable_sig_for_doc_impl(t)
+        return repr(t)
+
+    if isinstance(transform, (list, tuple)):
+        transform_sig = [_elem_sig(t) for t in transform]
+    elif isinstance(transform, TransformArgs):
+        transform_sig = transform.signature()
+    else:
+        transform_sig = _elem_sig(transform)
+    payload = json.dumps({
+        'name': name,
+        'parent_sig': parent_sig,
+        'ref_sig': ref_sig,
+        'transform_sig': transform_sig,
+        'group_type': group_type.name if isinstance(group_type, NodeGroupType) else str(group_type),
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+class StorePlaceholder:
+    pass
+
+class EmbedPlaceholder:
+    pass
+
+
+class NodeGroupType(str, Enum):
+    ORIGINAL = 'Original Source'
+    CHUNK = 'Chunk'
+    SUMMARY = 'Summary'
+    IMAGE_INFO = 'Image Info'
+    QUESTION_ANSWER = 'Question Answer'
+    OTHER = 'Other'
+
+
+class BuiltinGroups(object):
+    @dataclass
+    class Struct:
+        name: str
+        display_name: str
+        group_type: NodeGroupType
+        args: TransformArgs
+        parent: str = LAZY_ROOT_NAME
+        trans_node: bool = None
+
+        def __str__(self): return self.name
+        def __hash__(self): return hash(self.name)
+
+    CoarseChunk = Struct('CoarseChunk', '1024 Tokens Chunk', NodeGroupType.CHUNK,
+                         TArgs(f=SentenceSplitter, kwargs=dict(chunk_size=1024, chunk_overlap=100)))
+    MediumChunk = Struct('MediumChunk', '256 Tokens Chunk', NodeGroupType.CHUNK,
+                         TArgs(f=SentenceSplitter, kwargs=dict(chunk_size=256, chunk_overlap=25)))
+    FineChunk = Struct('FineChunk', '128 Tokens Chunk', NodeGroupType.CHUNK,
+                       TArgs(f=SentenceSplitter, kwargs=dict(chunk_size=128, chunk_overlap=12)))
+    ImgDesc = Struct('ImgDesc', 'Image Desc', NodeGroupType.OTHER,
+                     lambda x: x._content, LAZY_IMAGE_GROUP, True)
+
+
+class DocImpl:
+    _builtin_node_groups: Dict[str, Dict] = {}
+    _global_node_groups: Dict[str, Dict] = {}
+    _registered_file_reader: Dict[str, Callable] = {}
+
+    def __init__(self, embed: Dict[str, Callable], dataset_path: Optional[str] = None,
+                 doc_files: Optional[List[str]] = None, kb_group_name: Optional[str] = None,
+                 global_metadata_desc: Dict[str, GlobalMetadataDesc] = None,
+                 store: Optional[Union[Dict, LazyLLMStoreBase]] = None,
+                 processor: Optional[DocumentProcessor] = None, algo_name: Optional[str] = None,
+                 display_name: Optional[str] = None, description: Optional[str] = None,
+                 schema_extractor: Optional[Union[LLMBase, SchemaExtractor]] = None):
+        super().__init__()
+        self._local_file_reader: Dict[str, Callable] = {}
+        self._kb_group_name = kb_group_name or RAG_DEFAULT_GROUP_NAME
+        self._dataset_path = dataset_path
+        self._doc_files = doc_files
+        self._reader = DirectoryReader(None, self._local_file_reader, DocImpl._registered_file_reader)
+        self.node_groups: Dict[str, Dict] = {
+            LAZY_ROOT_NAME: dict(parent=None, display_name='Original Source', group_type=NodeGroupType.ORIGINAL),
+            LAZY_IMAGE_GROUP: dict(parent=None, display_name='Image Node', group_type=NodeGroupType.OTHER)
+        }
+        self.embed = {k: _EmbedWrapper(e) for k, e in embed.items()}
+        self._global_metadata_desc = global_metadata_desc
+        self._store = store  # NOTE: will be initialized in _lazy_init()
+        self._activated_groups = set([LAZY_ROOT_NAME, LAZY_IMAGE_GROUP])
+        # activated_embeddings maintains all node_groups and active embeddings
+        self._activated_embeddings = {LAZY_ROOT_NAME: set(), LAZY_IMAGE_GROUP: set()}  # {group_name: {em1, em2, ...}}
+        self._index_pending_registrations = []
+        self._processor = processor
+        self._algo_name = algo_name
+        self._display_name = display_name
+        self._description = description
+        self._schema_extractor = schema_extractor
+
+    def _init_node_groups(self):
+        node_groups = DocImpl._builtin_node_groups.copy()
+        node_groups.update(DocImpl._global_node_groups)
+        node_groups.update(self.node_groups)
+        self.node_groups = node_groups
+
+        for group in node_groups: self._activated_embeddings.setdefault(group, set())
+        self._activated_groups = set([g for g in self._activated_groups if g in node_groups])
+
+        # use list to avoid `dictionary changed size during iteration` error
+        def _activate_with_parents(group_name: str):
+            cur = group_name
+            while cur and cur not in self._activated_groups:
+                self._activated_groups.add(cur)
+                cur = self.node_groups[cur]['parent']
+
+        def _is_descendant(desc: str, ancestor: str) -> bool:
+            cur = self.node_groups.get(desc, {}).get('parent')
+            while cur:
+                if cur == ancestor:
+                    return True
+                cur = self.node_groups.get(cur, {}).get('parent')
+            return False
+
+        for group in list(self._activated_groups):
+            _activate_with_parents(self.node_groups[group]['parent'])
+            ref_group = self.node_groups[group].get('ref')
+            if ref_group and ref_group in node_groups:
+                parent_group = self.node_groups[group]['parent']
+                if parent_group and not _is_descendant(ref_group, parent_group):
+                    raise ValueError(f'Node group "{group}" has ref "{ref_group}" not under parent "{parent_group}".')
+                _activate_with_parents(ref_group)
+
+    @property
+    def store(self) -> _DocumentStore:
+        self._lazy_init()
+        return self._store
+
+    def _create_store(self):
+        store = self._store
+        if store is None and self._processor is not None:
+            store = getattr(self._processor, '_store_conf', None)
+        self._store = store or {'type': 'map'}
+        embed_dims, embed_datatypes = {}, {}
+        for k, e in self.embed.items():
+            embedding = e('a')
+            if is_sparse(embedding):
+                embed_datatypes[k] = DataType.SPARSE_FLOAT_VECTOR
+            else:
+                embed_dims[k] = len(embedding)
+                embed_datatypes[k] = DataType.FLOAT_VECTOR
+
+        self._store.pop('metadata_store', None)
+        self._store = _DocumentStore(store=self._store,
+                                     group_embed_keys=self._activated_embeddings, embed=self.embed,
+                                     embed_dims=embed_dims, embed_datatypes=embed_datatypes,
+                                     global_metadata_desc=self._global_metadata_desc)
+        self._store.activate_group(self._activated_groups)
+
+    @once_wrapper(reset_on_pickle=True)
+    def _create_schema_extractor(self):
+        if self._schema_extractor is None or isinstance(self._schema_extractor, SchemaExtractor):
+            return
+        elif isinstance(self._schema_extractor, LLMBase):
+            metadata_store_config = (
+                (self._store.pop('metadata_store', None) if self._store else None)
+                or _get_default_db_config(db_name=f'{self._algo_name}_metadata')
+            )
+            self._schema_extractor = SchemaExtractor(db_config=metadata_store_config, llm=self._schema_extractor)
+            return
+        else:
+            raise ValueError(f'Invalid type for schema extractor: {type(self._schema_extractor)}')
+
+    @once_wrapper(reset_on_pickle=True)
+    def _lazy_init(self) -> None:
+        self._init_node_groups()
+        self._create_schema_extractor()
+        self._create_store()
+        cloud = not (self._dataset_path or self._doc_files is not None)
+
+        self._resolve_index_pending_registrations()
+        if self._processor:
+            if not isinstance(self._processor, DocumentProcessor):
+                raise TypeError(
+                    f'processor must be a DocumentProcessor instance, got {type(self._processor).__name__!r}'
+                )
+            self._processor.register_algorithm(self._algo_name, self._store, self._reader, self.node_groups,
+                                               self._schema_extractor, self._display_name, self._description)
+        else:
+            self._processor = _Processor(self._store, self._build_schema_extractors_dict())
+
+        # `cloud` is True iff both dataset_path and doc_files are absent. Otherwise do a
+        # one-time ingest: DocImpl only owns the scan in map-store flows now (persistent
+        # store + dataset_path auto-upgrades to DocServer; DocumentProcessor + dataset_path
+        # is rejected at Document.__init__), so re-scan on every process start is harmless
+        # and matches the empty map store. No background monitor is started.
+        if not cloud:
+            self._ingest_local_dataset()
+
+    def _build_schema_extractors_dict(self):
+        if self._schema_extractor is None:
+            return {}
+        ext_name = getattr(self._schema_extractor, 'name', None) or self._algo_name
+        return {ext_name: self._schema_extractor}
+
+    def _resolve_index_pending_registrations(self):
+        for index_type, index_cls, index_args, index_kwargs in self._index_pending_registrations:
+            args = [self._resolve_index_placeholder(arg) for arg in index_args]
+            kwargs = {k: self._resolve_index_placeholder(v) for k, v in index_kwargs.items()}
+            self._store.register_index(index_type, index_cls(*args, **kwargs))
+        self._index_pending_registrations.clear()
+
+    @staticmethod
+    def _create_node_group_impl(cls, group_name, name, transform: Union[str, Callable],
+                                parent: str = LAZY_ROOT_NAME, *, trans_node: Optional[bool] = None,
+                                num_workers: int = 0, display_name: Optional[str] = None,
+                                group_type: NodeGroupType = NodeGroupType.CHUNK, ref: str = None, **kwargs):
+        group_name, parent = str(group_name), str(parent)
+        groups = getattr(cls, group_name)
+
+        def get_trans(t): return TransformArgs.from_dict(t) if isinstance(t, dict) else t
+
+        if isinstance(transform, (TransformArgs, tuple, list, dict)):
+            err_msg = '{} should be set in transform when transform is Dict, TransformArgs or List[TransformArgs]'
+            assert trans_node is None, err_msg.format('trans_node')
+            assert num_workers == 0, err_msg.format('num_workers')
+            assert not kwargs, err_msg.format('kwargs')
+            transforms = ([get_trans(t) for t in transform] if isinstance(transform, (list, tuple)) else
+                          get_trans(transform))
+        else:
+            transforms = TransformArgs(f=transform, trans_node=trans_node,
+                                       num_workers=num_workers, kwargs=kwargs)
+
+        if name in groups:
+            existing = groups[name]
+            existing_sig = existing.get('signature', '')
+            parent_sig = groups.get(parent, {}).get('signature', '') if parent != LAZY_ROOT_NAME else ''
+            ref_sig = groups.get(ref, {}).get('signature', '') if ref else ''
+            new_sig = _compute_node_group_signature(name, transforms, parent_sig, ref_sig, group_type)
+            if existing_sig and existing_sig == new_sig:
+                LOG.info(f'Node group {name!r} already registered with same signature, skipping.')
+                return
+            if existing_sig and existing_sig != new_sig:
+                raise ValueError(
+                    f'Node group {name!r} already exists with a different signature '
+                    f'(existing={existing_sig}, new={new_sig}). '
+                    'Use a different name or version to create a distinct node group.'
+                )
+            # existing_sig is empty (legacy data without signature): update in-place
+            LOG.warning('Node group %r has no signature (legacy data), updating in-place '
+                        'with new signature %r', name, new_sig)
+        for t in (transforms if isinstance(transform, list) else [transforms]):
+            if isinstance(t.f, str):
+                t.f = _transmap[t.f.lower()]
+            if isinstance(t.f, type):
+                assert t.trans_node is None, '`trans_node` is allowed only when transform is callable'
+                if not issubclass(t.f, NodeTransform): LOG.warning(
+                    'Please note! You are trying to use a completely custom transform class. The relationship '
+                    'between nodes may become unreliable, `Document.get_parent/get_child` functions and the '
+                    'target parameter of Retriever may have strange anomalies. Please use it at your own risk.')
+            else:
+                assert callable(t.f), f'transform should be callable, but get {t.f}'
+        parent_sig = groups.get(parent, {}).get('signature', '') if parent != LAZY_ROOT_NAME else ''
+        ref_sig = groups.get(ref, {}).get('signature', '') if ref else ''
+        signature = _compute_node_group_signature(name, transforms, parent_sig, ref_sig, group_type)
+        groups[name] = dict(transform=transforms, parent=parent, display_name=display_name or name,
+                            group_type=group_type, ref=ref, signature=signature)
+
+    @classmethod
+    def _create_builtin_node_group(cls, name, transform: Union[str, Callable], parent: str = LAZY_ROOT_NAME,
+                                   *, trans_node: Optional[bool] = None, num_workers: int = 0,
+                                   display_name: Optional[str] = None, group_type: NodeGroupType = NodeGroupType.CHUNK,
+                                   **kwargs) -> None:
+        DocImpl._create_node_group_impl(cls, '_builtin_node_groups', name=name, transform=transform, parent=parent,
+                                        trans_node=trans_node, num_workers=num_workers, display_name=display_name,
+                                        group_type=group_type, **kwargs)
+
+    @classmethod
+    def create_global_node_group(cls, name, transform: Union[str, Callable], parent: str = LAZY_ROOT_NAME, *,
+                                 trans_node: Optional[bool] = None, num_workers: int = 0,
+                                 display_name: Optional[str] = None,
+                                 group_type: NodeGroupType = NodeGroupType.CHUNK, ref: str = None,
+                                 version: Optional[str] = None, **kwargs) -> None:
+        if version is not None:
+            if not _VERSION_RE.match(version):
+                raise ValueError(f'Invalid version {version!r}. Must follow PEP 440 (e.g. 1.0, 1.1.1, 1.1.1a0).')
+            name = f'{name}@v{version}'
+        DocImpl._create_node_group_impl(cls, '_global_node_groups', name=name, transform=transform, parent=parent,
+                                        trans_node=trans_node, num_workers=num_workers, display_name=display_name,
+                                        group_type=group_type, ref=ref, **kwargs)
+
+    def create_node_group(self, name, transform: Union[str, Callable], parent: str = LAZY_ROOT_NAME, *,
+                          trans_node: Optional[bool] = None, num_workers: int = 0, display_name: Optional[str] = None,
+                          group_type: NodeGroupType = NodeGroupType.CHUNK, ref: str = None,
+                          version: Optional[str] = None, **kwargs) -> None:
+        # NOTE: if parent itself is versioned, pass the full versioned name (e.g. "chunks@v1.0");
+        # the version param does NOT auto-append a version suffix to parent.
+        if version is not None:
+            if not _VERSION_RE.match(version):
+                raise ValueError(f'Invalid version {version!r}. Must follow PEP 440 (e.g. 1.0, 1.1.1, 1.1.1a0).')
+            name = f'{name}@v{version}'
+        if self._lazy_init.flag:
+            if isinstance(self._processor, DocumentProcessor):
+                self._processor.register_new_node_group(name, dict(
+                    transform=transform, parent=parent, trans_node=trans_node,
+                    num_workers=num_workers, display_name=display_name,
+                    group_type=group_type, ref=ref, **kwargs,
+                ))
+                # Also update local node_groups so in-process callers see the new group.
+                DocImpl._create_node_group_impl(self, 'node_groups', name=name, transform=transform, parent=parent,
+                                                trans_node=trans_node, num_workers=num_workers,
+                                                display_name=display_name, group_type=group_type, ref=ref, **kwargs)
+                return
+            raise RuntimeError('Cannot add node group after document started in standalone mode')
+        DocImpl._create_node_group_impl(self, 'node_groups', name=name, transform=transform, parent=parent,
+                                        trans_node=trans_node, num_workers=num_workers, display_name=display_name,
+                                        group_type=group_type, ref=ref, **kwargs)
+
+    @classmethod
+    def register_global_reader(cls, pattern: str, func: Optional[Callable] = None):
+        if func is not None:
+            cls._registered_file_reader[pattern] = func
+            return None
+
+        def decorator(klass):
+            if callable(klass): cls._registered_file_reader[pattern] = klass
+            else: raise TypeError(f'The registered object {klass} is not a callable object.')
+            return klass
+        return decorator
+
+    def _resolve_index_placeholder(self, value):
+        if isinstance(value, StorePlaceholder): return self._store
+        elif isinstance(value, EmbedPlaceholder): return self.embed
+        return value
+
+    def register_index(self, index_type: str, index_cls: IndexBase, *args, **kwargs) -> None:
+        if bool(self._lazy_init.flag):
+            args = [self._resolve_index_placeholder(arg) for arg in args]
+            kwargs = {k: self._resolve_index_placeholder(v) for k, v in kwargs.items()}
+            self._store.register_index(index_type, index_cls(*args, **kwargs))
+        else:
+            self._index_pending_registrations.append((index_type, index_cls, args, kwargs))
+
+    def add_reader(self, pattern: str, func: Optional[Callable] = None):
+        assert callable(func), 'func for reader should be callable'
+        self._local_file_reader[pattern] = func
+        self._reader._lazy_init.flag.reset()
+
+    def _add_doc_to_store(self, input_files: List[str], ids: List[str],
+                          metadatas: List[Dict[str, Any]]) -> Set[str]:
+        '''Add documents to store. Returns the set of doc_ids that were successfully added.'''
+        success_ids: Set[str] = set()
+        for filepath, doc_id, metadata in zip(input_files, ids, metadatas):
+            filepath = os.path.abspath(filepath)
+            try:
+                self._processor.add_doc([filepath], self.node_groups, self._reader,
+                                        [doc_id], [metadata] if metadata is not None else None)
+                success_ids.add(doc_id)
+            except Exception as e:
+                LOG.error(f'Error adding document {doc_id} ({filepath}) to store: {e}')
+        return success_ids
+
+    def _list_dataset_files(self) -> List[str]:
+        from .doc_service.utils import list_dataset_files
+        return list_dataset_files(self._dataset_path)
+
+    def _list_local_files(self) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+        paths = ([self._resolve_doc_file_path(path) for path in self._doc_files]
+                 if self._doc_files is not None else self._list_dataset_files())
+        ids = [gen_docid(path) for path in paths]
+        return ids, paths, [{} for _ in paths]
+
+    @staticmethod
+    def _resolve_doc_file_path(path: str) -> str:
+        # Normalize absolute paths too, matching the prior os.path.abspath(...)
+        # behavior so gen_docid produces a stable id regardless of whether the
+        # caller used "/abs/./x" vs "/abs/x" or mixed separators on Windows.
+        if os.path.isabs(path):
+            return os.path.abspath(path)
+        if config['data_path']:
+            candidate = os.path.join(config['data_path'], path)
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+        return os.path.abspath(path)
+
+    def _ingest_local_dataset(self):
+        '''One-time ingest at `_lazy_init`: load every file in `dataset_path` /
+        `doc_files` into the store. No background polling / diff tracking —
+        directory change detection now lives in DocServer's SQL-backed scan
+        (persistent stores auto-upgrade to it).
+        '''
+        ids, paths, metadatas = self._list_local_files()
+        if paths:
+            self._add_doc_to_store(paths, ids, metadatas)
+
+    def _delete_doc_from_store(self, doc_ids: List[str] = None) -> None:
+        self._processor.delete_doc(doc_ids=doc_ids)
+
+    def activate_group(self, group_name: str, embed_keys: Optional[List[str]] = None, enable_embed: bool = True):
+        group_name = str(group_name)
+        self._activated_groups.add(group_name)
+        if embed_keys is None and enable_embed:
+            embed_keys = self.embed.keys()
+        if embed_keys:
+            activated_embeddings = self._activated_embeddings.setdefault(group_name, set())
+            if len(set(embed_keys) - activated_embeddings) == 0: return
+            activated_embeddings.update(embed_keys)
+
+        if self._lazy_init.flag:
+            if group_name not in self.node_groups: return
+            assert not embed_keys, 'Cannot add new embed_keys for node_group when Document is inited'
+            self._store.activate_group(parent := group_name)
+            while True:
+                parent = self.node_groups[parent]['parent']
+                if parent in self._activated_groups: break
+                self._store.activate_group(parent)
+                self._activated_groups.add(parent)
+            if self._store.is_group_empty(group_name): self._processor.reparse(group_name, self.node_groups)
+
+    def active_node_groups(self):
+        return {k: v for k, v in self._activated_embeddings.items() if k in self._activated_groups}
+
+    def retrieve(self, query: str, group_name: str, similarity: str, similarity_cut_off: Union[float, Dict[str, float]],
+                 index: str, topk: int, similarity_kws: dict, embed_keys: Optional[List[str]] = None,
+                 filters: Optional[Dict[str, Union[str, int, List, Set]]] = None, **kwargs) -> List[DocNode]:
+        self._lazy_init()
+
+        if index and index != 'default':
+            query_instance = self._store.get_index(type=index)
+            if query_instance is None:
+                raise NotImplementedError(f'Index type "{index}" is not registered in the store.')
+        else:
+            query_instance = self._store.get_index(type='default') or self._store
+        try:
+            nodes = query_instance.query(query=query, group_name=group_name, similarity_name=similarity,
+                                         similarity_cut_off=similarity_cut_off, topk=topk, embed_keys=embed_keys,
+                                         filters=filters, **similarity_kws, **kwargs)
+        except Exception as e:
+            raise RuntimeError(f'index type `{index}` of store `{type(self._store.impl)}` query failed: {e}')
+
+        for n in nodes:
+            n._store = self._store
+            n._node_groups = self.node_groups
+            n._children_loaded = False
+        return nodes
+
+    def find(self, nodes: List[DocNode], group: str) -> List[DocNode]:
+        if len(nodes) == 0: return nodes
+        self._lazy_init()
+
+        def get_full_path(name: str) -> List[str]:
+            path = [name]
+            while name != LAZY_ROOT_NAME:
+                name = self.node_groups[name]['parent']
+                path.append(name)
+            return list(reversed(path))
+
+        cur_group = nodes[0]._group
+        path_cur = get_full_path(cur_group)
+        path_tgt = get_full_path(group)
+
+        idx = 0
+        for a, b in zip(path_cur, path_tgt):
+            if a == b:
+                idx += 1
+            else:
+                break
+        parent_path = list(reversed(path_cur[idx - 1:-1]))
+        child_path = path_tgt[idx:]
+
+        for next_group in parent_path:
+            if not nodes: break
+            nodes = self.find_parent(nodes, next_group)
+
+        for next_group in child_path:
+            if not nodes: break
+            nodes = self.find_children(nodes, next_group)
+
+        if not nodes:
+            LOG.warning(f'We can not find any nodes for group `{group}`, please check your input')
+            return []
+        return nodes
+
+    def find_parent(self, nodes: List[DocNode], group: str) -> List[DocNode]:
+        if isinstance(nodes[0].parent, DocNode):
+            result = self._find_parent_with_node(nodes, group)
+        else:
+            result = self._find_parent_with_uid(nodes, group)
+        if not result:
+            LOG.warning(
+                f'We can not find any nodes for group `{group}`, please check your input'
+            )
+        LOG.debug(f'Found parent node for {group}: {result}')
+        return result
+
+    def _find_parent_with_node(self, nodes: list[DocNode], group: str):
+        result = set()
+
+        def recurse_parents(node: DocNode, visited: Set[DocNode]) -> None:
+            if node.parent:
+                if node.parent._group == group:
+                    visited.add(node.parent)
+                else:
+                    recurse_parents(node.parent, visited)
+
+        for node in nodes:
+            recurse_parents(node, result)
+        return list(result)
+
+    def _find_parent_with_uid(self, nodes: list[DocNode], group: str):
+        cur_group = nodes[0]._group
+        cur_nodes = nodes
+        while cur_group != group and cur_nodes[0].parent:
+            name = self.node_groups[cur_group]['parent']
+            parent_uids = {n.parent for n in cur_nodes}
+            kb_id = cur_nodes[0].global_metadata.get(RAG_KB_ID)
+            parents = self._store.get_nodes(group=name, kb_id=kb_id, uids=list(parent_uids), display=True)
+            if not parents: break
+            cur_group = parents[0]._group
+            cur_nodes = parents
+        return cur_nodes if cur_group == group else []
+
+    def find_children(self, nodes: List[DocNode], group: str) -> List[DocNode]:
+        if not nodes: return []
+        kb_id = nodes[0].global_metadata.get(RAG_KB_ID, None)
+        result = self._store.get_nodes(group=group, kb_id=kb_id, parent=[n._uid for n in nodes], display=True)
+        if not result:
+            LOG.warning(f'We cannot find any nodes for group `{group}`, please check your input.')
+        LOG.debug(f'Found children nodes for {group}: {result}')
+        return list(result)
+
+    def clear_cache(self, group_names: Optional[List[str]] = None):
+        self._store.clear_cache(group_names)
+
+    def drop_algorithm(self):
+        if isinstance(self._processor, DocumentProcessor):
+            self._processor.drop_algorithm(self._algo_name)
+        else:
+            raise ValueError('This method is only available when the Document has a DocumentProcessor')
+
+    def _analyze_schema_by_llm(self, kb_id: Optional[str] = None, doc_ids: Optional[List[str]] = None):
+        if not self._schema_extractor:
+            raise AttributeError('No schema extractor for this Document.')
+        self._create_schema_extractor()
+        data = self._store.get_nodes(group=LAZY_ROOT_NAME, kb_id=kb_id, doc_ids=doc_ids)
+        if not data:
+            LOG.error(f'No data from store for kb_id: {kb_id}, doc_ids: {doc_ids}')
+            return None
+        return self._schema_extractor.analyze_schema_and_register(data=data)
+
+    def _register_schema_set(self, schema_set: Type[BaseModel], kb_id: Optional[str] = DEFAULT_KB_ID,
+                             force_refresh: bool = False) -> str:
+        if not self._schema_extractor:
+            raise AttributeError('No schema extractor for this Document.')
+        self._create_schema_extractor()
+        set_id = self._schema_extractor.register_schema_set(schema_set=schema_set, force_refresh=force_refresh)
+        return set_id
+
+    def _get_nodes(self, uids: Optional[List[str]] = None, doc_ids: Optional[Set] = None,
+                   group: Optional[str] = None, kb_id: Optional[str] = None, numbers: Optional[Set] = None,
+                   limit: Optional[int] = None, offset: int = 0, return_total: bool = False,
+                   sort_by_number: bool = False) -> Union[List[DocNode], Tuple[List[DocNode], int]]:
+        self._lazy_init()
+        return self._store.get_nodes(
+            uids=uids, doc_ids=doc_ids, group=group, kb_id=kb_id, numbers=numbers,
+            limit=limit, offset=offset, return_total=return_total,
+            sort_by_number=sort_by_number, display=True,
+        )
+
+    def _get_window_nodes(self, node: DocNode, span: tuple[int, int] = (-5, 5),
+                          merge: bool = False) -> Union[List[DocNode], DocNode]:
+        if node is None:
+            return []
+        self._lazy_init()
+
+        if not isinstance(span, tuple) or len(span) != 2:
+            raise ValueError('span must be a tuple of (start, end)')
+
+        group = node.group
+        if not group:
+            LOG.warning('Window nodes query failed: node has no group')
+            return []
+
+        doc_id = node.global_metadata.get(RAG_DOC_ID)
+        if not doc_id:
+            LOG.warning('Window nodes query failed: node has no doc id')
+            return []
+
+        kb_id = node.global_metadata.get(RAG_KB_ID, DEFAULT_KB_ID)
+        start, end = span
+        if start > end:
+            start, end = end, start
+
+        node_number = node.number
+        numbers = set(range(node_number + start, node_number + end + 1))
+        numbers = {n for n in numbers if n > 0}
+
+        if not numbers:
+            return []
+
+        nodes = self._store.get_nodes(group=group, kb_id=kb_id, doc_ids=[doc_id], numbers=numbers)
+        nodes = sorted(nodes, key=lambda n: n.number)
+
+        if not merge:
+            return nodes
+
+        if any(type(n) is not DocNode for n in nodes):
+            # NOTE: QADocNode, ImageDocNode is not supported merge
+            LOG.warning('Merge window nodes only supports DocNode, returning list instead')
+            return nodes
+
+        merged_text = '\n'.join([n.text for n in nodes]) if nodes else ''
+        metadata = dict(node.metadata)
+        metadata.pop('lazyllm_store_num', None)
+        metadata.pop('number', None)
+        merged_node = DocNode(content=merged_text, group=group, embedding=node.embedding, parent=node._parent,
+                              metadata=metadata, global_metadata=dict(node.global_metadata))
+        return merged_node
+
+    def __call__(self, func_name: str, *args, **kwargs):
+        return getattr(self, func_name)(*args, **kwargs)
+
+
+for k, v in BuiltinGroups.__dict__.items():
+    if not k.startswith('_') and isinstance(v, BuiltinGroups.Struct):
+        assert k == v.name, 'builtin group name mismatch'
+        DocImpl._create_builtin_node_group(name=k, display_name=v.display_name, group_type=v.group_type,
+                                           transform=v.args, parent=v.parent, trans_node=v.trans_node)

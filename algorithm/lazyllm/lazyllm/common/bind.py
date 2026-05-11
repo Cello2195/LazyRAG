@@ -1,0 +1,159 @@
+import builtins
+import itertools
+from typing import Callable, Any
+from .globals import locals
+from .logger import LOG
+from .common import package
+
+
+class Placeholder(object):
+    _pool = dict()
+
+    def __new__(cls, idx):
+        if idx not in Placeholder._pool:
+            Placeholder._pool[idx] = super().__new__(cls)
+        return Placeholder._pool[idx]
+
+    def __init__(self, idx):
+        assert isinstance(idx, int)
+        self.idx = idx
+
+    def __deepcopy__(self, memo=None):
+        return self
+
+    def __repr__(self):
+        return f'placeholder._{self.idx}'
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return Placeholder.__new__, (Placeholder, self.idx)
+
+for i in range(10):
+    vars()[f'_{i}'] = Placeholder(i)
+
+def _setattr(self, key, v):
+    raise RuntimeError(f'Cannot set attr for Placeholder, you want to set {key}={v}')
+Placeholder.__setattr__ = _setattr
+
+
+class _MetaBind(type):
+    def __instancecheck__(self, __instance):
+        if isinstance(__instance, Bind) and isinstance(__instance._f, self):
+            return True
+        return super(__class__, self).__instancecheck__(__instance)
+
+
+class Bind(object):
+    class _None: pass
+
+    class Args(object):
+        class _None: pass
+        class Unpack(package): pass
+
+        def __init__(self, source_id: str, target_id: str = 'input', *, unpack: bool = False):
+            self._item_key, self._attr_key = Bind.Args._None, Bind.Args._None
+            self._source_id, self._target_id = source_id, target_id
+            self._unpack = unpack
+
+        def __getitem__(self, key: str):
+            self._item_key = key
+            return self
+
+        def __getattr__(self, key: str):
+            if key.startswith('__') and key.endswith('__'):
+                raise AttributeError(f'Args has no attribute {key}')
+            self._attr_key = key
+            return self
+
+        def __getstate__(self):
+            return self._item_key, self._attr_key, self._source_id, self._target_id
+
+        def __setstate__(self, state):
+            self._item_key, self._attr_key, self._source_id, self._target_id = state
+
+        def get_arg(self, source):
+            if not source or source['source'] != self._source_id:
+                if self._source_id in locals['bind_args']:
+                    source = locals['bind_args'][self._source_id]
+                    if not source or source['source'] != self._source_id:
+                        LOG.error(f'Get source failed, source is {source}, and expect id is {self._source_id}')
+                        raise RuntimeError('Internal Error, please report issue to `https://github.com/LazyAGI/LazyLLM`')
+                else:
+                    LOG.error(f'Get source failed, locals is {locals["bind_args"]} with id {locals._sid}, '
+                              f'and expect id is {self._source_id}')
+                    raise RuntimeError('Unable to find the bound parameter, possibly due to pipeline.input/output can '
+                                       'only be bind in direct member of pipeline! You may solve this by defining the '
+                                       'pipeline in a `with lazyllm.save_pipeline_result():` block.')
+            input = result = source[self._target_id]
+            source = source['source']
+            if self._item_key is not Bind.Args._None: result = input[self._item_key]
+            elif self._attr_key is not Bind.Args._None: result = getattr(input, self._attr_key)
+            if self._unpack and isinstance(result, package): result = Bind.Args.Unpack(result)
+            return result
+
+        def __repr__(self):
+            return f'<class \'lazyllm.common.bind.Bind.Args\' source={self._source_id}>'
+
+    def __init__(self, __bind_func=_None, *args, **kw):
+        object.__setattr__(self, '_hooks', [])
+        self._f = __bind_func() if isinstance(__bind_func, type) and __bind_func is not Bind._None else __bind_func
+        self._args = args
+        self._kw = kw
+
+    def _wraps_plain_callable(self) -> bool:
+        inner = getattr(self, '_f', None)
+        if inner is None or not callable(inner):
+            return False
+        return not (hasattr(inner, '_flow_id') or hasattr(inner, '_module_id'))
+
+    def __or__(self, other):
+        if isinstance(other, Bind):
+            return other.__ror__(self)
+        return NotImplementedError('Only support `binded-func | bind()` syntax!')
+
+    def __ror__(self, __value: Callable):
+        if self._f is not Bind._None: self._args = (self._f,) + self._args
+        self._f = __value
+        return self
+
+    # _bind_args_source: dict(input=input, args=dict(key=value))
+    def __call__(self, *args, _bind_args_source=None, **kw):
+        if self._f is None: return None
+        keys = set(kw.keys()).intersection(set(self._kw.keys()))
+        assert len(keys) == 0, f'Keys `{keys}` are already bind!'
+        bind_args = args if len(self._args) == 0 else (
+            [args[a.idx] if isinstance(a, Placeholder) else a for a in self._args])
+        kwargs = {k: args[v.idx] if isinstance(v, Placeholder) else v for k, v in self._kw.items()}
+        bind_args = [a.get_arg(_bind_args_source) if isinstance(a, Bind.Args) else a for a in bind_args]
+        bind_args = list(itertools.chain.from_iterable(x if isinstance(x, Bind.Args.Unpack) else [x] for x in bind_args))
+        kwargs = {k: v.get_arg(_bind_args_source) if isinstance(v, Bind.Args) else v for k, v in kwargs.items()}
+        if self._hooks:
+            from lazyllm.hook import execution_with_hooks
+            merged = {**kwargs, **kw}
+            return execution_with_hooks(self, *args, **merged)(self._f)(*bind_args, **merged)
+        return self._f(*bind_args, **kwargs, **kw)
+
+    # TODO: modify it
+    def __repr__(self) -> str:
+        return self._f.__repr__() + '(bind args: {})'.format(
+            ', '.join([repr(a) if a is not self else 'self' for a in self._args] + [
+                f'{k}={repr(v) if v is not self else "self"}' for k, v in self._kw.items()]))
+
+    def __getattr__(self, name):
+        # name will be '_f' in copy.deepcopy
+        if name != '_f':
+            return getattr(self._f, name)
+        return super(__class__, self).__getattr__(name)
+
+    def __setattr__(self, __name: str, __value: Any) -> None:
+        if __name not in ('_f', '_args', '_kw', '_has_root', '_hooks'):
+            return setattr(self._f, __name, __value)
+        return super(__class__, self).__setattr__(__name, __value)
+
+    def __eq__(self, value):
+        return value == self._f
+
+    def bind(self, *args, **kw):
+        return Bind(self, *args, **kw)
+
+
+builtins.bind = Bind

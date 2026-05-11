@@ -1,0 +1,512 @@
+::: lazyllm.tools.agent.code_interpreter
+    exclude-members:
+
+::: lazyllm.tools.sandbox.LazyLLMSandboxBase
+    members:
+    exclude-members:
+
+::: lazyllm.tools.sandbox.DummySandbox
+    members:
+    exclude-members:
+
+::: lazyllm.tools.sandbox.SandboxFusion
+    members:
+    exclude-members:
+
+::: lazyllm.tools.IntentClassifier
+    members:
+    - intent_promt_hook
+    - post_process_result
+    exclude-members:
+
+::: lazyllm.tools.Document
+    members: [connect_sql_manager, get_sql_manager, extract_db_schema, update_database, create_kb_group, activate_group, activate_groups, get_store, get_embed, register_index, find, clear_cache, create_node_group, find_parent, find_children, register_global_reader, add_reader]
+    exclude-members:
+
+::: lazyllm.tools.rag.store.ChromaStore
+    members: [dir, connect, upsert, delete, get, search]
+    exclude-members:
+
+::: lazyllm.tools.rag.store.MilvusStore
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.store.hybrid.hybrid_store.HybridStore
+    members: connect, upsert, delete, get, search
+    exclude-members:
+
+::: lazyllm.tools.rag.store.hybrid.oceanbase_store.OceanBaseStore
+    members: connect, upsert, delete, get, search
+    exclude-members:
+
+::: lazyllm.tools.rag.store.ElasticSearchStore
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.ReaderBase
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.PandasCSVReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.PandasExcelReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.PDFReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.PPTXReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.VideoAudioReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.SqlManager
+    members:
+        - get_session
+        - check_connection
+        - set_desc
+        - get_all_tables
+        - get_table_orm_class
+        - execute_commit
+        - execute_query
+        - create_table
+        - drop_table
+        - insert_values
+    exclude-members:
+
+::: lazyllm.tools.Reranker
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.readerBase.LazyLLMReaderBase
+    members:
+	exclude-members:
+
+::: lazyllm.tools.rag.readers.readerBase.TxtReader
+    members:
+	exclude-members:
+
+::: lazyllm.tools.rag.component.bm25.BM25
+    members: retrieve
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_to_db.SchemaExtractor
+    members:
+	- extract_and_store
+        - register_schema_set
+        - has_schema_set
+        - analyze_schema_and_register
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.DocxReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.EpubReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.HWPReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.ImageReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.IPYNBReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.MineruPDFReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.MarkdownReader
+    members:
+        - remove_images
+        - remove_hyperlinks
+    exclude-members:
+
+::: lazyllm.tools.rag.readers.MboxReader
+    members:
+	exclude-members:
+
+::: lazyllm.tools.SqlCall
+    members:
+        - sql_query_promt_hook
+        - sql_explain_prompt_hook
+        - extract_sql_from_response
+	exclude-members:
+
+::: lazyllm.tools.rag.default_index.DefaultIndex
+    members:
+        - update
+        - remove
+        - query
+    exclude-members:
+
+::: lazyllm.tools.Reranker
+    members: [register_reranker]
+    exclude-members: forward
+
+::: lazyllm.tools.Retriever
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.rag.retriever.TempDocRetriever
+    members: [create_node_group, add_subretriever]
+    exclude-members:
+
+::: lazyllm.tools.rag.retriever.UrlDocument
+    members: [find]
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_service.DocServer
+    members: [upload, add, reparse, delete, transfer, patch_metadata, list_docs, get_doc, list_tasks, get_task, cancel_task, list_kbs, get_kb, list_chunks, list_algorithms, get_algorithm_info, create_kb, update_kb, delete_kb, delete_kbs]
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_service.base.AddFileItem
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_service.base.UploadRequest
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_service.base.AddRequest
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_service.base.TransferItem
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_service.base.TransferRequest
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.data_loaders.DirectoryReader
+    members: load_data
+	exclude-members:
+
+::: lazyllm.tools.rag.transform.sentence.SentenceSplitter
+    members: [split_text, from_tiktoken_encoder, from_huggingface_tokenizer]
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.character.CharacterSplitter
+    memebers:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.recursive.RecursiveSplitter
+    memebers:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.markdown.MarkdownSplitter
+    memebers:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.CodeSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.HTMLSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.JSONSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.JSONLSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.YAMLSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.GeneralCodeSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.code.XMLSplitter
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.layout.LayoutNodeParser
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.contentfilter.ContentFiltParser
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.treebuilder.TreeBuilderParser
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.treefixer.TreeFixerParser
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.groupby.GroupNodeParser
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.base.NodeTransform
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.base.Rule
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.base.RuleSet
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.factory.LLMParser
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.factory.TransformArgs
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.factory.FuncNodeTransform
+    members: transform
+    exclude-members:
+
+::: lazyllm.tools.rag.transform.factory.AdaptiveTransform
+    members: transform
+    exclude-members:
+
+::: lazyllm.tools.rag.similarity.register_similarity
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_node.DocNode
+    members: get_children_str, get_parent_id, get_content, to_dict, set_embedding
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_node.QADocNode
+    members: get_text
+    exclude-members:
+
+::: lazyllm.tools.rag.dataReader.SimpleDirectoryReader
+    members: [load_file, find_extractor_by_file, get_default_reader, add_post_action_for_default_reader]
+    exclude-members:
+
+::: lazyllm.tools.rag.dataReader.FileReader
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.web.DocWebModule
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.parsing_service.server.DocumentProcessor
+    members: [start, register_algorithm, drop_algorithm]
+    exclude-members:
+
+::: lazyllm.tools.rag.parsing_service.worker.DocumentProcessorWorker
+    members: [start, stop]
+    exclude-members:
+
+::: lazyllm.tools.WebModule
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.CodeGenerator
+    members: [choose_prompt]
+    exclude-members: forward
+
+::: lazyllm.tools.ParameterExtractor
+    members: [choose_prompt]
+    exclude-members: forward
+
+::: lazyllm.tools.QustionRewrite
+    members: choose_prompt
+    exclude-members: forward
+
+::: lazyllm.tools.agent.toolsManager.ToolManager
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.ModuleTool
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.LazyLLMAgentBase
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.SkillManager
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.FunctionCall
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.ReactAgent
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.PlanAndSolveAgent
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.ReWOOAgent
+    members:
+    exclude-members: forward
+
+::: lazyllm.tools.rag.smart_embedding_index.SmartEmbeddingIndex
+    members: update, remove, query
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_node.ImageDocNode
+    members: do_embedding, get_content, get_text
+    exclude-members:
+
+::: lazyllm.tools.rag.store.hybrid.MapStore
+    members: connect, upsert, delete, get, search
+    exclude-members:
+
+::: lazyllm.tools.rag.store.segment.opensearch_store.OpenSearchStore
+    members: connect, upsert, delete, get, search
+    exclude-members:
+
+::: lazyllm.tools.rag.rerank.ModuleReranker
+    members: forward
+    exclude-members:
+
+::: lazyllm.tools.rag.global_metadata.GlobalMetadataDesc
+    members:
+    exclude-members:
+
+::: lazyllm.tools.rag.IndexBase.update
+    members:
+	exclude-members:
+
+::: lazyllm.tools.rag.IndexBase.remove
+    members:
+	exclude-members:
+
+::: lazyllm.tools.rag.IndexBase.query
+    members:
+	exclude-members:
+
+::: lazyllm.tools.rag.index_base.IndexBase
+    members:
+
+::: lazyllm.tools.BaseEvaluator
+    members: process_one_data, validate_inputs_key, batch_process, save_res
+    exclude-members:
+
+::: lazyllm.tools.ResponseRelevancy
+    members:
+    exclude-members:
+
+::: lazyllm.tools.Faithfulness
+    members:
+    exclude-members:
+
+::: lazyllm.tools.LLMContextRecall
+    members:
+    exclude-members:
+
+::: lazyllm.tools.NonLLMContextRecall
+    members:
+    exclude-members:
+
+::: lazyllm.tools.ContextRelevance
+    members:
+    exclude-members:
+
+::: lazyllm.tools.HttpRequest
+    members:
+    exclude-members:
+
+::: lazyllm.tools.DBManager
+    members: execute_query
+    exclude-members:
+
+::: lazyllm.tools.MongoDBManager
+    members:
+    exclude-members:
+
+::: lazyllm.tools.HttpTool
+    members:
+    exclude-members:
+
+::: lazyllm.tools.agent.functionCall.StreamResponse
+    members:
+    exclude-members:
+
+::: lazyllm.tools.MCPClient
+    members: [call_tool, list_tools, get_tools, aget_tools, deploy]
+    exclude-members:
+
+::: lazyllm.tools.tools.GoogleSearch
+    members: forward
+
+::: lazyllm.tools.tools.TencentSearch
+    members: 
+    exclude-members:
+
+::: lazyllm.tools.rag.web.WebUi
+    members:
+    exclude-members:
+
+::: lazyllm.tools.http_request.http_executor_response.HttpExecutorResponse
+    members: extract_file, get_content_type
+    exclude-members:
+
+::: lazyllm.tools.StreamCallHelper
+    members: [split_text]
+    exclude-members:
+
+::: lazyllm.tools.rag.LazyLLMStoreBase
+    members: [connect, upsert, delete, get, search]
+    exclude-members:
+
+::: lazyllm.tools.rag.doc_impl.DocImpl
+    members: create_global_node_group, create_node_group, register_global_reader, register_index, add_reader, worker, activate_group, active_node_groups, retrieve, find, find_parent, find_children, clear_cache
+    exclude-members:
+
+::: lazyllm.tools.services.client.ClientBase
+    members: uniform_status
+    exclude-members:
+
+::: lazyllm.tools.services.services.ServerBase
+    members: authorize_current_user
+    exclude-members:
+
+::: lazyllm.tools.infer_service.serve.InferServer
+    members: create_job, cancel_job, list_jobs, get_job_info, get_job_log
+    exclude-members:
+
+::: lazyllm.tools.rag.store.hybrid.sensecore_store.SenseCoreStore
+    members:
+    exclude-members:
+
+::: lazyllm.tools.review.tools.chinese_corrector.get_errors
+    members:
+    exclude-members:
+
+::: lazyllm.tools.review.tools.chinese_corrector.ChineseCorrector
+    members: correct, correct_batch
+    exclude-members:
+
+::: lazyllm.tools.rag.QueryEnhACProcessor
+    members: __call__, get_matches, update_data_source, update_discriminator
+    exclude-members:

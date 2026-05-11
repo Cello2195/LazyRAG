@@ -1,0 +1,126 @@
+backend/auth-service/api_permissions.json
+.vscode/settings.json
+backend/core/core
+.env
+
+.flake8-python.path
+__pycache__
+
+# python files
+*__pycache__*
+*.pyc
+
+# temp files
+test/
+node_modules/
+dist/
+tmp/
+build
+*.lock
+*.db
+mkdocs.yml
+.temp
+infer_log/
+*.log
+log.txt
+save_ckpt/
+wget-log
+
+# dev tools
+.vscode
+.claude
+.cursor
+.codex
+
+# docs
+lazyllm_chroma/
+docs/en/assets
+docs/zh/assets
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# build directories
+build*
+lazyllm_cpp.egg-info/
+!build*.sh
+!build_document.py
+
+.venv/
+data/
+volumes/
+.conda
+
+# evo runtime artifacts
+evo/output/
+data/evo/
+
+# macOS
+.DS_Store
+
+AGENTS.md
+algorithm/.agentic_rag/
+version.*
+algorithm/Dockerfile.chat-rebase
+
+# extra python/dev caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# local runtime/output artifacts
+logs/
+outputs/
+artifacts/
+runtime/
+*.sqlite3
+
+# local env variants
+.env.*
+!.env.example
+!.env.template
+
+# playwright/browser test artifacts
+test-results/
+playwright-report/
+
+# large tutorial/media files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+# generated/local binaries
+backend/file-watcher/file_watcher

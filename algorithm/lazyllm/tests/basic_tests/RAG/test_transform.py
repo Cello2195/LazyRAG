@@ -1,0 +1,1942 @@
+import lazyllm
+from lazyllm.tools.rag.transform import (
+    SentenceSplitter, CharacterSplitter, RecursiveSplitter, MarkdownSplitter,
+    CodeSplitter, JSONSplitter, YAMLSplitter, HTMLSplitter, XMLSplitter,
+    GeneralCodeSplitter, JSONLSplitter, LayoutNodeParser, GroupNodeParser,
+    ContentFiltParser, TreeBuilderParser, TreeFixerParser, Rule, RuleSet
+)
+from lazyllm.tools.rag.transform.markdown import _MdSplit
+from lazyllm.tools.rag.transform.layout import NO_GROUPING
+from lazyllm.tools.rag.transform.base import NodeTransform, _TextSplitterBase, _Split, _TokenTextSplitter
+from lazyllm.tools.rag.doc_node import DocNode, RichDocNode
+from lazyllm.tools.rag.global_metadata import RAG_DOC_ID, RAG_DOC_PATH
+import pytest
+from unittest.mock import MagicMock
+from lazyllm.tools.rag.document import Document
+from lazyllm.tools.rag.retriever import Retriever
+from lazyllm.tools.rag.store import LAZY_ROOT_NAME, LAZY_IMAGE_GROUP
+from lazyllm.tools.rag.store.document_store import _DocumentStore
+from lazyllm.tools.rag.store.store_base import DEFAULT_KB_ID
+from lazyllm.tools.rag.parsing_service import _Processor
+from lazyllm.tools.rag.utils import gen_docid
+from lazyllm.tools.rag.global_metadata import RAG_KB_ID
+from lazyllm.tools.rag import TransformArgs
+import os
+import tempfile
+
+@pytest.fixture
+def doc_node():
+    node = MagicMock(spec=DocNode)
+    node.get_text.return_value = '这是一个测试文本，用于验证分割器的逻辑是否正确。请认真检查！'
+    node.get_metadata_str.return_value = ''
+    return node
+
+
+class TestSentenceSplitter:
+    def setup_method(self):
+        '''Setup for tests: initialize the SentenceSplitter.'''
+        self.splitter = SentenceSplitter(chunk_size=30, chunk_overlap=10)
+
+    def test_forward(self):
+        text = ''' Before college the two main things I worked on, outside of school, were writing and programming. I didn't write essays. I wrote what beginning writers were supposed to write then, and probably still are: short stories. My stories were awful. They had hardly any plot, just characters with strong feelings, which I imagined made them deep.'''  # noqa: E501
+        docs = [DocNode(text=text)]
+
+        result = self.splitter.batch_forward(docs, node_group='default')
+        result_texts = [n.get_text() for n in result]
+        expected_texts = [
+            "Before college the two main things I worked on, outside of school, were writing and programming.I didn't write essays.",  # noqa: E501
+            "I didn't write essays.I wrote what beginning writers were supposed to write then, and probably still are: short stories.My stories were awful.",  # noqa: E501
+            'My stories were awful.They had hardly any plot, just characters with strong feelings, which I imagined made them deep.',  # noqa: E501
+        ]
+        assert result_texts == expected_texts
+
+        trans = lazyllm.pipeline(lambda x: x, self.splitter)
+        assert [n.get_text() for n in trans(docs[0])] == expected_texts
+
+    def test_split(self):
+        splitter = SentenceSplitter(chunk_size=10, chunk_overlap=0)
+        text = 'This is a test sentence. It needs to be split into multiple chunks.'
+        splits = splitter._split(text, chunk_size=10)
+        assert len(splits) == 2
+        assert splits[0].text == 'This is a test sentence.'
+        assert splits[1].text == 'It needs to be split into multiple chunks.'
+
+    def test_merge(self):
+        splitter = SentenceSplitter(chunk_size=15, chunk_overlap=10)
+        text = 'This is a test sentence. It needs to be split into multiple chunks.'
+        splits = splitter._split(text, chunk_size=15)
+        chunks = splitter._merge(splits, chunk_size=15)
+        assert chunks == ['This is a test sentence. It needs to be split into multiple chunks.']
+
+    def test_split_text(self):
+        splitter = SentenceSplitter(chunk_size=10, chunk_overlap=0)
+        text = 'This is a test sentence. It needs to be split into multiple chunks.'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['This is a test sentence.', 'It needs to be split into multiple chunks.']
+
+
+class TestCharacterSplitter:
+    def setup_method(self):
+        '''Setup for tests: initialize the CharacterSplitter.'''
+        self.splitter = CharacterSplitter(chunk_size=30, overlap=10, separator=',', keep_separator=True)
+
+    def test_forward(self):
+        text = ''' Before college the two main things I worked on, outside of school, were writing and programming. I didn't write essays. I wrote what beginning writers were supposed to write then, and probably still are: short stories. My stories were awful. They had hardly any plot, just characters with strong feelings, which I imagined made them deep.'''  # noqa: E501
+        docs = [DocNode(text=text)]
+        result = self.splitter.batch_forward(docs, node_group='default')
+        result_texts = [n.get_text() for n in result]
+        expected_texts = [
+            ' Before college the two main things I worked on, outside of school,',
+            " outside of school, were writing and programming. I didn't write essays. I wrote what beginning writers were supposed to write then,",  # noqa: E501
+            ' wrote what beginning writers were supposed to write then, and probably still are: short stories. My stories were awful. They had hardly any plot,',  # noqa: E501
+            ' stories were awful. They had hardly any plot, just characters with strong feelings, which I imagined made them deep.'  # noqa: E501
+        ]
+        assert result_texts == expected_texts
+
+        trans = lazyllm.pipeline(lambda x: x, self.splitter)
+        assert [n.get_text() for n in trans(docs[0])] == expected_texts
+
+    def test_get_separator_pattern(self):
+        splitter = CharacterSplitter(separator=' ')
+        sep_pattern = splitter._get_separator_pattern(' ')
+        assert sep_pattern == r'(?: )'
+        splitter = CharacterSplitter(separator=' ', keep_separator=True)
+        sep_pattern = splitter._get_separator_pattern(' ')
+        assert sep_pattern == r'( )'
+
+    def test_default_split(self):
+        splitter = CharacterSplitter(separator=' ')
+        text = 'Hello, world! This is a test.'
+        splits = splitter._default_split(splitter._get_separator_pattern(' '), text)
+        assert splits == ['Hello,', 'world!', 'This', 'is', 'a', 'test.']
+
+        splitter = CharacterSplitter(separator=',', keep_separator=True)
+        text = 'Hello, world! This is a test.'
+        splits = splitter._default_split(splitter._get_separator_pattern(','), text)
+        assert splits == ['Hello,', ' world! This is a test.']
+
+        splitter = CharacterSplitter(separator=',', keep_separator=False)
+        text = 'Hello, world! This is a test.'
+        splits = splitter._default_split(splitter._get_separator_pattern(','), text)
+        assert splits == ['Hello', ' world! This is a test.']
+
+    def test_split_text(self):
+        splitter = CharacterSplitter(separator=',', chunk_size=7, overlap=0)
+        text = 'Hello, world! This is a test.'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', ' world! This is a test.']
+
+    def test_split_text_with_split_fn(self):
+        splitter = CharacterSplitter(separator=',', chunk_size=7, overlap=0)
+        splitter.set_split_fns([lambda t: t.split(',')])
+        text = 'Hello, world! This is a test.'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', ' world! This is a test.']
+        splitter.add_split_fn(lambda t: t.split(' '), index=0)
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello,', 'world!', 'This', 'is', 'a', 'test.']
+        splitter.clear_split_fns()
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', ' world! This is a test.']
+
+        def custom_split_with_separator(text, separator):
+            chunks = text.split(separator)
+            return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+        splitter = CharacterSplitter(separator=',', chunk_size=4, overlap=0)
+        splitter.set_split_fns(custom_split_with_separator)
+        text = 'apple, banana, cherry, date, happy, sad'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['apple', 'banana', 'cherry', 'date', 'happy', 'sad']
+
+    def test_split_text_with_weak_split_fn(self):
+        splitter = CharacterSplitter(separator=',', chunk_size=4, overlap=0)
+        splitter.set_split_fns([lambda t: t.split('!')])
+        text = 'Hello, world! This is a test.'
+        splits = splitter.split_text(text, metadata_size=0)
+        print(splits)
+        assert splits == ['Hello, world', ' This is a test', '.']
+
+
+class TestRecursiveSplitter:
+    def setup_method(self):
+        '''Setup for tests: initialize the RecursiveSplitter.'''
+        self.splitter = RecursiveSplitter(chunk_size=30, overlap=10, separators=[',', '.', ' ', ''])
+
+    def test_forward(self):
+        text = ''' Before college the two main things I worked on, outside of school, were writing and programming. I didn't write essays. I wrote what beginning writers were supposed to write then, and probably still are: short stories. My stories were awful. They had hardly any plot, just characters with strong feelings, which I imagined made them deep.'''  # noqa: E501
+        docs = [DocNode(text=text)]
+        result = self.splitter.batch_forward(docs, node_group='default')
+        result_texts = [n.get_text() for n in result]
+        expected_texts = [
+            ' Before college the two main things I worked on outside of school',
+            " outside of school were writing and programming. I didn't write essays. I wrote what beginning writers were supposed to write then",  # noqa: E501
+            ' I wrote what beginning writers were supposed to write then and probably still are: short stories. My stories were awful. They had hardly any plot',  # noqa: E501
+            ' My stories were awful. They had hardly any plot just characters with strong feelings which I imagined made them deep.'  # noqa: E501
+        ]
+
+        assert result_texts == expected_texts
+
+        trans = lazyllm.pipeline(lambda x: x, self.splitter)
+        assert [n.get_text() for n in trans(docs[0])] == expected_texts
+
+    def test_split_text(self):
+        splitter = RecursiveSplitter(separators=['\n\n', '\n', '!', ' '], chunk_size=5, overlap=0)
+        text = 'Hello\n\nworld! This\nis a test.'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', 'world! This', 'is a test.']
+
+    def test_split_text_with_character_split_fn(self):
+        splitter = RecursiveSplitter(separators=['\n\n', '\n', '!', ' '], chunk_size=9, overlap=0)
+        splitter.set_split_fns([lambda t: t.split('\n\n')])
+        text = 'Hello\n\nworld! This\nis a test.'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', 'world! This\nis a test.']
+        splitter.add_split_fn(lambda t: t.split('\n'))
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', 'world! This\nis a test.']
+        splitter.clear_split_fns()
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello', 'world! This\nis a test.']
+
+
+class TestMarkdownSplitter:
+    def setup_method(self):
+        '''Setup for tests: initialize the MarkdownSplitter.'''
+        self.splitter = MarkdownSplitter(chunk_size=30, overlap=10)
+
+    def test_get_heading_level(self):
+        markdown = MarkdownSplitter()
+        lines = [
+            '# 标题1\n内容A',
+            '## 标题2\n内容B',
+            '### ###',
+            '普通文本',
+            '####### 非法标题',
+            '## ### 这其实是标题文字'
+        ]
+        assert markdown._get_heading_level(lines[0]) == 1
+        assert markdown._get_heading_level(lines[1]) == 2
+        assert markdown._get_heading_level(lines[2]) == 3
+        assert markdown._get_heading_level(lines[3]) == 0
+        assert markdown._get_heading_level(lines[4]) == 0
+        assert markdown._get_heading_level(lines[5]) == 2
+
+    def test_split_markdown_by_semantics(self):
+        text = '\n\n# 标题1\n内容A\n\n## 标题2\n内容B\n\n### 标题3\n内容C\n\n# 标题4\n内容D\n内容E'
+        splits = self.splitter.split_markdown_by_semantics(text)
+        assert splits == [
+            _MdSplit(path=['标题1'], level=1, header='标题1', content='内容A', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2'], level=2, header='标题2', content='内容B', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2', '标题3'], level=3, header='标题3', content='内容C', token_size=5, type='content'),
+            _MdSplit(path=['标题4'], level=1, header='标题4', content='内容D\n内容E', token_size=11, type='content')
+        ]
+
+    def test_split(self):
+        text = '\n\n# 标题1\n内容A\n\n## 标题2\n内容B\n\n### 标题3\n内容C\n\n# 标题4\n内容D\n内容E'
+        markdown = MarkdownSplitter(keep_headers=True, keep_trace=True)
+        splits = markdown._split(text, 1024)
+        assert splits == [
+            _MdSplit(path=['标题1'], level=1, header='标题1', content='内容A', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2'], level=2, header='标题2', content='内容B', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2', '标题3'], level=3, header='标题3', content='内容C', token_size=5, type='content'),
+            _MdSplit(path=['标题4'], level=1, header='标题4', content='内容D\n内容E', token_size=11, type='content')
+        ]
+
+        makrkdown = MarkdownSplitter(keep_headers=True, keep_trace=False)
+        splits = makrkdown._split(text, 1024)
+        assert splits == [
+            _MdSplit(path=['标题1'], level=1, header='标题1', content='内容A', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2'], level=2, header='标题2', content='内容B', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2', '标题3'], level=3, header='标题3', content='内容C', token_size=5, type='content'),
+            _MdSplit(path=['标题4'], level=1, header='标题4', content='内容D\n内容E', token_size=11, type='content')
+        ]
+
+        markdown = MarkdownSplitter(keep_headers=False, keep_trace=False)
+        splits = markdown._split(text, 1024)
+        assert splits == [
+            _MdSplit(path=['标题1'], level=1, header='标题1', content='内容A', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2'], level=2, header='标题2', content='内容B', token_size=5, type='content'),
+            _MdSplit(path=['标题1', '标题2', '标题3'], level=3, header='标题3', content='内容C', token_size=5, type='content'),
+            _MdSplit(path=['标题4'], level=1, header='标题4', content='内容D\n内容E', token_size=11, type='content')
+        ]
+
+    def test_merge(self):
+        md_text = '\n\n# LinuxBoot on Ampere Mt. Jade Platform' \
+                  '\nThe Ampere Altra Family processor based Mt. Jade platform is a high-performance ARM server platform, offering up to 256 processor cores in a ' \
+                  'dual socket configuration. The Tianocore EDK2 firmware for the Mt. Jade platform has been fully upstreamed to the tianocore/edk2-platforms repository, '\
+                  'enabling the community to build and experiment with the platform\'s firmware using entirely open-source code. It also supports LinuxBoot, an open-source ' \
+                  'firmware framework that reduces boot time, enhances security, and increases flexibility compared to standard UEFI firmware.'\
+                  '\n\nMt. Jade has also achieved a significant milestone by becoming [the first server certified under the Arm SystemReady LS certification program](https://community.arm.com/arm-community-blogs' \
+                  '/b/architectures-and-processors-blog/posts/arm-systemready-ls). SystemReady LS ensures compliance with standardized boot and runtime environments for Linux-based ' \
+                  'systems, enabling seamless deployment across diverse hardware. This certification further emphasizes Mt. Jade\'s readiness for enterprise and cloud-scale adoption '\
+                  'by providing assurance of compatibility, performance, and reliability.' \
+                  '\n\nThis case study explores the LinuxBoot implementation on the Ampere Mt. Jade platform, inspired by the approach used in [Google\'s LinuxBoot deployment](Google_study.md).' \
+                  '\n\n## Ampere EDK2-LinuxBoot Components' \
+                  '\nThe Mt. Jade platform embraces a hybrid firmware architecture, combining UEFI/EDK2 for hardware initialization and LinuxBoot for advanced boot functionalities. The platform aligns closely with step 6 in the LinuxBoot adoption model.' \
+                  '\n\n<img src=\"../images/Case-study-Ampere.svg\">' \
+                  '\n\nThe entire boot firmware stack for the Mt. Jade is open source and available in the Github.' \
+                  '\n\n* **EDK2**: The PEI and minimal (stripped-down) DXE drivers, including both common and platform code, are fully open source and resides in Tianocore edk2-platforms and edk2 repositories.'\
+                  '\n* **LinuxBoot**: The LinuxBoot binary ([flashkernel](../glossary.md)) for Mt. Jade is supported in the [linuxboot/linuxboot](https://github.com/linuxboot/linuxboot/tree/main/mainboards/ampere/jade) repository.' \
+                  '\n\n## Ampere Solution for LinuxBoot as a Boot Device Selection'\
+                  '\nAmpere has implemented and successfully upstreamed a solution for integrating LinuxBoot as a Boot Device Selection (BDS) option into the TianoCore EDK2 framework, as seen in commit [ArmPkg: Implement PlatformBootManagerLib for LinuxBoot](https://github.com/tianocore/edk2/commit/62540372230ecb5318a9c8a40580a14beeb9ded0). This innovation simplifies the boot process for the Mt. Jade platform and aligns with LinuxBoot\'s goals of efficiency and flexibility.'\
+                  '\n\nUnlike the earlier practice that replaced the UEFI Shell with a LinuxBoot flashkernel, Ampere\'s solution introduces a custom BDS implementation that directly boots into the LinuxBoot environment as the active boot option. This approach bypasses the need to load the UEFI Shell or UiApp (UEFI Setup Menu), which depend on numerous unnecessary DXE drivers.'\
+                  '\n\nTo further enhance flexibility, Ampere introduced a new GUID specifically for the LinuxBoot binary, ensuring clear separation from the UEFI Shell GUID. This distinction allows precise identification of LinuxBoot components in the firmware.'\
+                  '\n\n## Build Process'\
+                  '\nBuilding a flashable EDK2 firmware image with an integrated LinuxBoot flashkernel for the Ampere Mt. Jade platform involves two main steps: building the LinuxBoot flashkernel and integrating it into the EDK2 firmware build.'\
+                  '\n\n### Step 1: Build the LinuxBoot Flashkernel'\
+                  '\nThe LinuxBoot flash kernel is built as follows:'\
+                  '\n\n```bash\ngit clone https://github.com/linuxboot/linuxboot.git'\
+                  '\ncd linuxboot/mainboards/ampere/jade && make fetch flashkernel'\
+                  '\n```' \
+                  '\n\nAfter the build process completes, the flash kernel will be located at: linuxboot/mainboards/ampere/jade/flashkernel'\
+                  '\n\n### Step 2: Build the EDK2 Firmware Image with the Flash Kernel'\
+                  '\nThe EDK2 firmware image is built with the LinuxBoot flashkernel integrated into the flash image using the following steps:'\
+                  '\n\n```bash'\
+                  '\ngit clone https://github.com/tianocore/edk2-platforms.git'\
+                  '\ngit clone https://github.com/tianocore/edk2.git'\
+                  '\ngit clone https://github.com/tianocore/edk2-non-osi.git'\
+                  '\n./edk2-platforms/Platform/Ampere/buildfw.sh -b RELEASE -t GCC -p Jade -l linuxboot/mainboards/ampere/jade/flashkernel'\
+                  '\n```'\
+                  '\n\nThe `buildfw.sh` script automatically integrates the LinuxBoot flash kernel (provided via the -l option) as part of the final EDK2 firmware image.'\
+                  '\n\nThis process generates a flashable EDK2 firmware image with embedded LinuxBoot, ready for deployment on the Ampere Mt. Jade platform.'\
+                  '\n\n## Booting with LinuxBoot\nWhen powered on, the system will boot into the u-root and automatically kexec to the target OS.'\
+                  '\n\n```text'\
+                  '\nRun /init as init process'\
+                  '\n1970/01/01 00:00:10 Welcome to u-root!'\
+                  '\n...'\
+                  '\n```'\
+                  '\n\n## Future Work'\
+                  '\nWhile the LinuxBoot implementation on the Ampere Mt. Jade platform represents a significant milestone, several advanced features and improvements remain to be explored. These enhancements would extend the platform\'s capabilities, improve its usability, and reinforce its position as a leading open source firmware solution. Key areas for future development include:'\
+                  '\n\n### Secure Boot with LinuxBoot'\
+                  '\nOne of the critical areas for future development is enabling secure boot verification for the target operating system. In the LinuxBoot environment, the target OS is typically booted using kexec. However, it is unclear how Secure Boot operates in this context, as kexec bypasses traditional firmware-controlled secure boot mechanisms. Future work should investigate how to extend Secure Boot principles to kexec, ensuring that the OS kernel and its components are verified and authenticated before execution. This may involve implementing signature checks and utilizing trusted certificate chains directly within the LinuxBoot environment to mimic the functionality of UEFI Secure Boot during the kexec process.'\
+                  '\n\n### TPM Support'\
+                  '\nThe platform supports TPM, but its integration with LinuxBoot is yet to be defined. Future work could explore utilizing the TPM for secure boot measurements, and system integrity attestation.'\
+                  '\n\n### Expanding Support for Additional Ampere Platforms'\
+                  '\nBuilding on the success of LinuxBoot on Mt. Jade, future efforts should expand support to other Ampere platforms. This would ensure broader adoption and usability across different hardware configurations.'\
+                  '\n\n### Optimizing the Transition Between UEFI and LinuxBoot'\
+                  '\nImproving the efficiency of the handoff between UEFI and LinuxBoot could further reduce boot times. This optimization would involve refining the initialization process and minimizing redundant operations during the handoff.'\
+                  '\n\n### Advanced Diagnostics and Monitoring Tools'\
+                  '\nAdding more diagnostic and monitoring tools to the LinuxBoot u-root environment would enhance debugging and system management. These tools could provide deeper insights into system performance and potential issues, improving reliability and maintainability.'\
+                  '\n\n## See Also'\
+                  '\n* [LinuxBoot on Ampere Platforms: A new (old) approach to firmware](https://amperecomputing.com/blogs/linuxboot-on-ampere-platforms--a-new-old-approach-to-firmware)'  # noqa: E501
+        markdown = MarkdownSplitter(keep_headers=True, keep_trace=True, overlap=30)
+        splits = markdown._split(md_text, 300)
+        merged = markdown._merge(splits, 300)
+        expected_merged = [
+            "The Ampere Altra Family processor based Mt. Jade platform is a high-performance ARM server platform, offering up to 256 processor cores in a dual socket configuration. The Tianocore EDK2 firmware for the Mt. Jade platform has been fully upstreamed to the tianocore/edk2-platforms repository, enabling the community to build and experiment with the platform's firmware using entirely open-source code. It also supports LinuxBoot, an open-source firmware framework that reduces boot time, enhances security, and increases flexibility compared to standard UEFI firmware.\n\nMt. Jade has also achieved a significant milestone by becoming [the first server certified under the Arm SystemReady LS certification program](https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/arm-systemready-ls). SystemReady LS ensures compliance with standardized boot and runtime environments for Linux-based systems, enabling seamless deployment across diverse hardware. This certification further emphasizes Mt. Jade's readiness for enterprise and cloud-scale adoption by providing assurance of compatibility, performance, and reliability.\n\nThis case study explores the LinuxBoot implementation on the Ampere Mt. Jade platform, inspired by the approach used in [Google's LinuxBoot deployment](Google_study.md).",  # noqa: E501
+
+            'The Mt. Jade platform embraces a hybrid firmware architecture, combining UEFI/EDK2 for hardware initialization and LinuxBoot for advanced boot functionalities. The platform aligns '  # noqa: E501
+            'closely with step 6 in the LinuxBoot adoption model.\n\n<img src="../images/Case-study-Ampere.svg">\n\nThe entire boot firmware stack for the Mt. '  # noqa: E501
+            'Jade is open source and available in the Github.\n\n* **EDK2**: The PEI and minimal (stripped-down) DXE drivers, including both common and platform code, are fully open source and resides in Tianocore edk2-platforms and edk2 repositories.\n* **LinuxBoot**: The LinuxBoot binary ([flashkernel](../glossary.md)) for Mt. Jade is supported in the [linuxboot/linuxboot](https://github.com/linuxboot/linuxboot/tree/main/mainboards/ampere/jade) repository.',  # noqa: E501
+
+            "Ampere has implemented and successfully upstreamed a solution for integrating LinuxBoot as a Boot Device Selection (BDS) option into the TianoCore EDK2 framework, as seen in commit [ArmPkg: Implement PlatformBootManagerLib for LinuxBoot](https://github.com/tianocore/edk2/commit/62540372230ecb5318a9c8a40580a14beeb9ded0). This innovation simplifies the boot process for the Mt. Jade platform and aligns with LinuxBoot's goals of efficiency and flexibility.\n\nUnlike the earlier practice that replaced the UEFI Shell with a LinuxBoot flashkernel, Ampere's solution introduces a custom BDS implementation that directly boots into the LinuxBoot environment as the active boot option. This approach bypasses the need to load the UEFI Shell or UiApp (UEFI Setup Menu), which depend on numerous unnecessary DXE drivers.\n\nTo further enhance flexibility, Ampere introduced a new GUID specifically for the LinuxBoot binary, ensuring clear separation from the UEFI Shell GUID. This distinction allows precise identification of LinuxBoot components in the firmware.",  # noqa: E501
+
+            'Building a flashable EDK2 firmware image with an integrated LinuxBoot flashkernel for the Ampere Mt. Jade platform involves two main steps: building the LinuxBoot flashkernel and integrating it into the EDK2 firmware build.',  # noqa: E501
+
+            'The LinuxBoot flash kernel is built as follows:\n\n```bash\ngit clone https://github.com/linuxboot/linuxboot.git\ncd linuxboot/mainboards/ampere/jade && make fetch flashkernel\n```\n\nAfter the build process completes, the flash kernel will be located at: linuxboot/mainboards/ampere/jade/flashkernel',  # noqa: E501
+
+            'The EDK2 firmware image is built with the LinuxBoot flashkernel integrated into the flash image using the following steps:\n\n```bash\ngit clone https://github.com/tianocore/edk2-platforms.git\ngit clone https://github.com/tianocore/edk2.git\ngit clone https://github.com/tianocore/edk2-non-osi.git\n./edk2-platforms/Platform/Ampere/buildfw.sh -b RELEASE -t GCC -p Jade -l linuxboot/mainboards/ampere/jade/flashkernel\n```\n\nThe `buildfw.sh` script automatically integrates the LinuxBoot flash kernel (provided via the -l option) as part of the final EDK2 firmware image.\n\nThis process generates a flashable EDK2 firmware image with embedded LinuxBoot, ready for deployment on the Ampere Mt. Jade platform.',  # noqa: E501
+
+            'When powered on, the system will boot into the u-root and automatically kexec to the target OS.\n\n```text\nRun /init as init process\n1970/01/01 00:00:10 Welcome to u-root!\n...\n```',  # noqa: E501
+
+            "While the LinuxBoot implementation on the Ampere Mt. Jade platform represents a significant milestone, several advanced features and improvements remain to be explored. These enhancements would extend the platform's capabilities, improve its usability, and reinforce its position as a leading open source firmware solution. Key areas for future development include:",  # noqa: E501
+
+            'One of the critical areas for future development is enabling secure boot verification for the target operating system. In the LinuxBoot environment, the target OS is typically booted using kexec. However, it is unclear how Secure Boot operates in this context, as kexec bypasses traditional firmware-controlled secure boot mechanisms. Future work should investigate how to extend Secure Boot principles to kexec, ensuring that the OS kernel and its components are verified and authenticated before execution. This may involve implementing signature checks and utilizing trusted certificate chains directly within the LinuxBoot environment to mimic the functionality of UEFI Secure Boot during the kexec process.',  # noqa: E501
+
+            'The platform supports TPM, but its integration with LinuxBoot is yet to be defined. Future work could explore utilizing the TPM for secure boot measurements, and system integrity attestation.',  # noqa: E501
+
+            'Building on the success of LinuxBoot on Mt. Jade, future efforts should expand support to other Ampere platforms. This would ensure broader adoption and usability across different hardware configurations.',  # noqa: E501
+
+            'Improving the efficiency of the handoff between UEFI and LinuxBoot could further reduce boot times. This optimization would involve refining the initialization process and minimizing redundant operations during the handoff.',  # noqa: E501
+
+            'Adding more diagnostic and monitoring tools to the LinuxBoot u-root environment would enhance debugging and system management. These tools could provide deeper insights into system performance and potential issues, improving reliability and maintainability.',  # noqa: E501
+
+            '* [LinuxBoot on Ampere Platforms: A new (old) approach to firmware](https://amperecomputing.com/blogs/linuxboot-on-ampere-platforms--a-new-old-approach-to-firmware)']  # noqa: E501
+        for i in range(len(merged)):
+            assert merged[i].content == expected_merged[i]
+            assert merged[i].metadata.get('path') is not None
+            assert merged[i].metadata.get('header') is not None
+
+        markdown = MarkdownSplitter(keep_headers=True, keep_trace=False, overlap=30)
+        splits = markdown._split(md_text, 300)
+        merged = markdown._merge(splits, 300)
+        for i in range(len(merged)):
+            assert merged[i].content == expected_merged[i]
+            assert merged[i].metadata.get('path') is None
+            assert merged[i].metadata.get('header') is not None
+
+        markdown = MarkdownSplitter(keep_headers=False, keep_trace=False, overlap=30)
+        splits = markdown._split(md_text, 300)
+        merged = markdown._merge(splits, 300)
+        for i in range(len(merged)):
+            assert merged[i].content == expected_merged[i]
+            assert merged[i].metadata.get('path') is None
+            assert merged[i].metadata.get('header') is None
+
+    def test_keep_code_blocks(self):
+        md_text = '\n\n# LinuxBoot on Ampere Mt. Jade Platform\nThe Ampere Altra Family processor based Mt. Jade platform is a high-performance ARM server platform, offering up to 256 processor cores in a dual socket configuration. The Tianocore EDK2 firmware for the Mt. Jade platform has been fully upstreamed to the tianocore/edk2-platforms repository, enabling the community to build and experiment with the platform\'s firmware using entirely open-source code. It also supports LinuxBoot, an open-source firmware framework that reduces boot time, enhances security, and increases flexibility compared to standard UEFI firmware.\n\nMt. Jade has also achieved a significant milestone by becoming [the first server certified under the Arm SystemReady LS certification program](https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/arm-systemready-ls). SystemReady LS ensures compliance with standardized boot and runtime environments for Linux-based systems, enabling seamless deployment across diverse hardware. This certification further emphasizes Mt. Jade\'s readiness for enterprise and cloud-scale adoption by providing assurance of compatibility, performance, and reliability.\n\nThis case study explores the LinuxBoot implementation on the Ampere Mt. Jade platform, inspired by the approach used in [Google\'s LinuxBoot deployment](Google_study.md).\n\n## Ampere EDK2-LinuxBoot Components\nThe Mt. Jade platform embraces a hybrid firmware architecture, combining UEFI/EDK2 for hardware initialization and LinuxBoot for advanced boot functionalities. The platform aligns closely with step 6 in the LinuxBoot adoption model.\n\n<img src=\"../images/Case-study-Ampere.svg\">\n\nThe entire boot firmware stack for the Mt. Jade is open source and available in the Github.\n\n* **EDK2**: The PEI and minimal (stripped-down) DXE drivers, including both common and platform code, are fully open source and resides in Tianocore edk2-platforms and edk2 repositories.\n* **LinuxBoot**: The LinuxBoot binary ([flashkernel](../glossary.md)) for Mt. Jade is supported in the [linuxboot/linuxboot](https://github.com/linuxboot/linuxboot/tree/main/mainboards/ampere/jade) repository.\n\n## Ampere Solution for LinuxBoot as a Boot Device Selection\nAmpere has implemented and successfully upstreamed a solution for integrating LinuxBoot as a Boot Device Selection (BDS) option into the TianoCore EDK2 framework, as seen in commit [ArmPkg: Implement PlatformBootManagerLib for LinuxBoot](https://github.com/tianocore/edk2/commit/62540372230ecb5318a9c8a40580a14beeb9ded0). This innovation simplifies the boot process for the Mt. Jade platform and aligns with LinuxBoot\'s goals of efficiency and flexibility.\n\nUnlike the earlier practice that replaced the UEFI Shell with a LinuxBoot flashkernel, Ampere\'s solution introduces a custom BDS implementation that directly boots into the LinuxBoot environment as the active boot option. This approach bypasses the need to load the UEFI Shell or UiApp (UEFI Setup Menu), which depend on numerous unnecessary DXE drivers.\n\nTo further enhance flexibility, Ampere introduced a new GUID specifically for the LinuxBoot binary, ensuring clear separation from the UEFI Shell GUID. This distinction allows precise identification of LinuxBoot components in the firmware.\n\n## Build Process\nBuilding a flashable EDK2 firmware image with an integrated LinuxBoot flashkernel for the Ampere Mt. Jade platform involves two main steps: building the LinuxBoot flashkernel and integrating it into the EDK2 firmware build.\n\n### Step 1: Build the LinuxBoot Flashkernel\nThe LinuxBoot flash kernel is built as follows:\n\n```bash\ngit clone https://github.com/linuxboot/linuxboot.git\ncd linuxboot/mainboards/ampere/jade && make fetch flashkernel\n```\n\nAfter the build process completes, the flash kernel will be located at: linuxboot/mainboards/ampere/jade/flashkernel\n\n### Step 2: Build the EDK2 Firmware Image with the Flash Kernel\nThe EDK2 firmware image is built with the LinuxBoot flashkernel integrated into the flash image using the following steps:\n\n```bash\ngit clone https://github.com/tianocore/edk2-platforms.git\ngit clone https://github.com/tianocore/edk2.git\ngit clone https://github.com/tianocore/edk2-non-osi.git\n./edk2-platforms/Platform/Ampere/buildfw.sh -b RELEASE -t GCC -p Jade -l linuxboot/mainboards/ampere/jade/flashkernel\n```\n\nThe `buildfw.sh` script automatically integrates the LinuxBoot flash kernel (provided via the -l option) as part of the final EDK2 firmware image.\n\nThis process generates a flashable EDK2 firmware image with embedded LinuxBoot, ready for deployment on the Ampere Mt. Jade platform.\n\n## Booting with LinuxBoot\nWhen powered on, the system will boot into the u-root and automatically kexec to the target OS.\n\n```text\nRun /init as init process\n1970/01/01 00:00:10 Welcome to u-root!\n...\n```\n\n## Future Work\nWhile the LinuxBoot implementation on the Ampere Mt. Jade platform represents a significant milestone, several advanced features and improvements remain to be explored. These enhancements would extend the platform\'s capabilities, improve its usability, and reinforce its position as a leading open source firmware solution. Key areas for future development include:\n\n### Secure Boot with LinuxBoot\nOne of the critical areas for future development is enabling secure boot verification for the target operating system. In the LinuxBoot environment, the target OS is typically booted using kexec. However, it is unclear how Secure Boot operates in this context, as kexec bypasses traditional firmware-controlled secure boot mechanisms. Future work should investigate how to extend Secure Boot principles to kexec, ensuring that the OS kernel and its components are verified and authenticated before execution. This may involve implementing signature checks and utilizing trusted certificate chains directly within the LinuxBoot environment to mimic the functionality of UEFI Secure Boot during the kexec process.\n\n### TPM Support\nThe platform supports TPM, but its integration with LinuxBoot is yet to be defined. Future work could explore utilizing the TPM for secure boot measurements, and system integrity attestation.\n\n### Expanding Support for Additional Ampere Platforms\nBuilding on the success of LinuxBoot on Mt. Jade, future efforts should expand support to other Ampere platforms. This would ensure broader adoption and usability across different hardware configurations.\n\n### Optimizing the Transition Between UEFI and LinuxBoot\nImproving the efficiency of the handoff between UEFI and LinuxBoot could further reduce boot times. This optimization would involve refining the initialization process and minimizing redundant operations during the handoff.\n\n### Advanced Diagnostics and Monitoring Tools\nAdding more diagnostic and monitoring tools to the LinuxBoot u-root environment would enhance debugging and system management. These tools could provide deeper insights into system performance and potential issues, improving reliability and maintainability.\n\n## See Also\n* [LinuxBoot on Ampere Platforms: A new (old) approach to firmware](https://amperecomputing.com/blogs/linuxboot-on-ampere-platforms--a-new-old-approach-to-firmware)'  # noqa: E501
+        markdown = MarkdownSplitter(keep_headers=False, keep_trace=False, overlap=30, keep_code_blocks=True)
+        splits = markdown._split(md_text, 300)
+        expected_splits = [
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform'], level=1, header='LinuxBoot on Ampere Mt. Jade Platform', content="The Ampere Altra Family processor based Mt. Jade platform is a high-performance ARM server platform, offering up to 256 processor cores in a dual socket configuration. The Tianocore EDK2 firmware for the Mt. Jade platform has been fully upstreamed to the tianocore/edk2-platforms repository, enabling the community to build and experiment with the platform's firmware using entirely open-source code. It also supports LinuxBoot, an open-source firmware framework that reduces boot time, enhances security, and increases flexibility compared to standard UEFI firmware.\n\nMt. Jade has also achieved a significant milestone by becoming [the first server certified under the Arm SystemReady LS certification program](https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/arm-systemready-ls). SystemReady LS ensures compliance with standardized boot and runtime environments for Linux-based systems, enabling seamless deployment across diverse hardware. This certification further emphasizes Mt. Jade's readiness for enterprise and cloud-scale adoption by providing assurance of compatibility, performance, and reliability.\n\nThis case study explores the LinuxBoot implementation on the Ampere Mt. Jade platform, inspired by the approach used in [Google's LinuxBoot deployment](Google_study.md).", token_size=271, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Ampere EDK2-LinuxBoot Components'], level=2, header='Ampere EDK2-LinuxBoot Components', content='The Mt. Jade platform embraces a hybrid firmware architecture, combining UEFI/EDK2 for hardware initialization and LinuxBoot for advanced boot functionalities. The platform aligns closely with step 6 in the LinuxBoot adoption model.\n\n<img src="../images/Case-study-Ampere.svg">\n\nThe entire boot firmware stack for the Mt. Jade is open source and available in the Github.\n\n* **EDK2**: The PEI and minimal (stripped-down) DXE drivers, including both common and platform code, are fully open source and resides in Tianocore edk2-platforms and edk2 repositories.\n* **LinuxBoot**: The LinuxBoot binary ([flashkernel](../glossary.md)) for Mt. Jade is supported in the [linuxboot/linuxboot](https://github.com/linuxboot/linuxboot/tree/main/mainboards/ampere/jade) repository.', token_size=204, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Ampere Solution for LinuxBoot as a Boot Device Selection'], level=2, header='Ampere Solution for LinuxBoot as a Boot Device Selection', content="Ampere has implemented and successfully upstreamed a solution for integrating LinuxBoot as a Boot Device Selection (BDS) option into the TianoCore EDK2 framework, as seen in commit [ArmPkg: Implement PlatformBootManagerLib for LinuxBoot](https://github.com/tianocore/edk2/commit/62540372230ecb5318a9c8a40580a14beeb9ded0). This innovation simplifies the boot process for the Mt. Jade platform and aligns with LinuxBoot's goals of efficiency and flexibility.\n\nUnlike the earlier practice that replaced the UEFI Shell with a LinuxBoot flashkernel, Ampere's solution introduces a custom BDS implementation that directly boots into the LinuxBoot environment as the active boot option. This approach bypasses the need to load the UEFI Shell or UiApp (UEFI Setup Menu), which depend on numerous unnecessary DXE drivers.\n\nTo further enhance flexibility, Ampere introduced a new GUID specifically for the LinuxBoot binary, ensuring clear separation from the UEFI Shell GUID. This distinction allows precise identification of LinuxBoot components in the firmware.", token_size=240, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process'], level=2, header='Build Process', content='Building a flashable EDK2 firmware image with an integrated LinuxBoot flashkernel for the Ampere Mt. Jade platform involves two main steps: building the LinuxBoot flashkernel and integrating it into the EDK2 firmware build.', token_size=47, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process', 'Step 1: Build the LinuxBoot Flashkernel'], level=3, header='Step 1: Build the LinuxBoot Flashkernel', content='The LinuxBoot flash kernel is built as follows:', token_size=10, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process', 'Step 1: Build the LinuxBoot Flashkernel'], level=3, header='Step 1: Build the LinuxBoot Flashkernel', content='git clone https://github.com/linuxboot/linuxboot.git\ncd linuxboot/mainboards/ampere/jade && make fetch flashkernel', token_size=34, type='bash'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process', 'Step 1: Build the LinuxBoot Flashkernel'], level=3, header='Step 1: Build the LinuxBoot Flashkernel', content='After the build process completes, the flash kernel will be located at: linuxboot/mainboards/ampere/jade/flashkernel', token_size=29, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process', 'Step 2: Build the EDK2 Firmware Image with the Flash Kernel'], level=3, header='Step 2: Build the EDK2 Firmware Image with the Flash Kernel', content='The EDK2 firmware image is built with the LinuxBoot flashkernel integrated into the flash image using the following steps:', token_size=24, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process', 'Step 2: Build the EDK2 Firmware Image with the Flash Kernel'], level=3, header='Step 2: Build the EDK2 Firmware Image with the Flash Kernel', content='git clone https://github.com/tianocore/edk2-platforms.git\ngit clone https://github.com/tianocore/edk2.git\ngit clone https://github.com/tianocore/edk2-non-osi.git\n./edk2-platforms/Platform/Ampere/buildfw.sh -b RELEASE -t GCC -p Jade -l linuxboot/mainboards/ampere/jade/flashkernel', token_size=108, type='bash'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Build Process', 'Step 2: Build the EDK2 Firmware Image with the Flash Kernel'], level=3, header='Step 2: Build the EDK2 Firmware Image with the Flash Kernel', content='The `buildfw.sh` script automatically integrates the LinuxBoot flash kernel (provided via the -l option) as part of the final EDK2 firmware image.\n\nThis process generates a flashable EDK2 firmware image with embedded LinuxBoot, ready for deployment on the Ampere Mt. Jade platform.', token_size=65, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Booting with LinuxBoot'], level=2, header='Booting with LinuxBoot', content='When powered on, the system will boot into the u-root and automatically kexec to the target OS.', token_size=23, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Booting with LinuxBoot'], level=2, header='Booting with LinuxBoot', content='Run /init as init process\n1970/01/01 00:00:10 Welcome to u-root!\n...', token_size=25, type='text'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Future Work'], level=2, header='Future Work', content="While the LinuxBoot implementation on the Ampere Mt. Jade platform represents a significant milestone, several advanced features and improvements remain to be explored. These enhancements would extend the platform's capabilities, improve its usability, and reinforce its position as a leading open source firmware solution. Key areas for future development include:", token_size=61, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Future Work', 'Secure Boot with LinuxBoot'], level=3, header='Secure Boot with LinuxBoot', content='One of the critical areas for future development is enabling secure boot verification for the target operating system. In the LinuxBoot environment, the target OS is typically booted using kexec. However, it is unclear how Secure Boot operates in this context, as kexec bypasses traditional firmware-controlled secure boot mechanisms. Future work should investigate how to extend Secure Boot principles to kexec, ensuring that the OS kernel and its components are verified and authenticated before execution. This may involve implementing signature checks and utilizing trusted certificate chains directly within the LinuxBoot environment to mimic the functionality of UEFI Secure Boot during the kexec process.', token_size=126, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Future Work', 'TPM Support'], level=3, header='TPM Support', content='The platform supports TPM, but its integration with LinuxBoot is yet to be defined. Future work could explore utilizing the TPM for secure boot measurements, and system integrity attestation.', token_size=37, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Future Work', 'Expanding Support for Additional Ampere Platforms'], level=3, header='Expanding Support for Additional Ampere Platforms', content='Building on the success of LinuxBoot on Mt. Jade, future efforts should expand support to other Ampere platforms. This would ensure broader adoption and usability across different hardware configurations.', token_size=36, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Future Work', 'Optimizing the Transition Between UEFI and LinuxBoot'], level=3, header='Optimizing the Transition Between UEFI and LinuxBoot', content='Improving the efficiency of the handoff between UEFI and LinuxBoot could further reduce boot times. This optimization would involve refining the initialization process and minimizing redundant operations during the handoff.', token_size=37, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'Future Work', 'Advanced Diagnostics and Monitoring Tools'], level=3, header='Advanced Diagnostics and Monitoring Tools', content='Adding more diagnostic and monitoring tools to the LinuxBoot u-root environment would enhance debugging and system management. These tools could provide deeper insights into system performance and potential issues, improving reliability and maintainability.', token_size=40, type='content'),  # noqa: E501
+
+            _MdSplit(path=['LinuxBoot on Ampere Mt. Jade Platform', 'See Also'], level=2, header='See Also', content='* [LinuxBoot on Ampere Platforms: A new (old) approach to firmware](https://amperecomputing.com/blogs/linuxboot-on-ampere-platforms--a-new-old-approach-to-firmware)', token_size=59, type='content')]  # noqa: E501
+        assert splits == expected_splits
+        merged = markdown._merge(splits, 300)
+        expected_merged = [
+            "The Ampere Altra Family processor based Mt. Jade platform is a high-performance ARM server platform, offering up to 256 processor cores in a dual socket configuration. The Tianocore EDK2 firmware for the Mt. Jade platform has been fully upstreamed to the tianocore/edk2-platforms repository, enabling the community to build and experiment with the platform's firmware using entirely open-source code. It also supports LinuxBoot, an open-source firmware framework that reduces boot time, enhances security, and increases flexibility compared to standard UEFI firmware.\n\nMt. Jade has also achieved a significant milestone by becoming [the first server certified under the Arm SystemReady LS certification program](https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/arm-systemready-ls). SystemReady LS ensures compliance with standardized boot and runtime environments for Linux-based systems, enabling seamless deployment across diverse hardware. This certification further emphasizes Mt. Jade's readiness for enterprise and cloud-scale adoption by providing assurance of compatibility, performance, and reliability.\n\nThis case study explores the LinuxBoot implementation on the Ampere Mt. Jade platform, inspired by the approach used in [Google's LinuxBoot deployment](Google_study.md).",  # noqa: E501
+
+            'The Mt. Jade platform embraces a hybrid firmware architecture, combining UEFI/EDK2 for hardware initialization and LinuxBoot for advanced boot functionalities. The platform aligns closely with step 6 in the LinuxBoot adoption model.\n\n<img src="../images/Case-study-Ampere.svg">\n\nThe entire boot firmware stack for the Mt. Jade is open source and available in the Github.\n\n* **EDK2**: The PEI and minimal (stripped-down) DXE drivers, including both common and platform code, are fully open source and resides in Tianocore edk2-platforms and edk2 repositories.\n* **LinuxBoot**: The LinuxBoot binary ([flashkernel](../glossary.md)) for Mt. Jade is supported in the [linuxboot/linuxboot](https://github.com/linuxboot/linuxboot/tree/main/mainboards/ampere/jade) repository.',  # noqa: E501
+
+            "Ampere has implemented and successfully upstreamed a solution for integrating LinuxBoot as a Boot Device Selection (BDS) option into the TianoCore EDK2 framework, as seen in commit [ArmPkg: Implement PlatformBootManagerLib for LinuxBoot](https://github.com/tianocore/edk2/commit/62540372230ecb5318a9c8a40580a14beeb9ded0). This innovation simplifies the boot process for the Mt. Jade platform and aligns with LinuxBoot's goals of efficiency and flexibility.\n\nUnlike the earlier practice that replaced the UEFI Shell with a LinuxBoot flashkernel, Ampere's solution introduces a custom BDS implementation that directly boots into the LinuxBoot environment as the active boot option. This approach bypasses the need to load the UEFI Shell or UiApp (UEFI Setup Menu), which depend on numerous unnecessary DXE drivers.\n\nTo further enhance flexibility, Ampere introduced a new GUID specifically for the LinuxBoot binary, ensuring clear separation from the UEFI Shell GUID. This distinction allows precise identification of LinuxBoot components in the firmware.", 'Building a flashable EDK2 firmware image with an integrated LinuxBoot flashkernel for the Ampere Mt. Jade platform involves two main steps: building the LinuxBoot flashkernel and integrating it into the EDK2 firmware build.', 'The LinuxBoot flash kernel is built as follows:',  # noqa: E501
+
+            'git clone https://github.com/linuxboot/linuxboot.git\ncd linuxboot/mainboards/ampere/jade && make fetch flashkernel',  # noqa: E501
+
+            'After the build process completes, the flash kernel will be located at: linuxboot/mainboards/ampere/jade/flashkernel',  # noqa: E501
+
+            'The EDK2 firmware image is built with the LinuxBoot flashkernel integrated into the flash image using the following steps:',  # noqa: E501
+
+            'git clone https://github.com/tianocore/edk2-platforms.git\ngit clone https://github.com/tianocore/edk2.git\ngit clone https://github.com/tianocore/edk2-non-osi.git\n./edk2-platforms/Platform/Ampere/buildfw.sh -b RELEASE -t GCC -p Jade -l linuxboot/mainboards/ampere/jade/flashkernel',  # noqa: E501
+
+            'The `buildfw.sh` script automatically integrates the LinuxBoot flash kernel (provided via the -l option) as part of the final EDK2 firmware image.\n\nThis process generates a flashable EDK2 firmware image with embedded LinuxBoot, ready for deployment on the Ampere Mt. Jade platform.',  # noqa: E501
+
+            'When powered on, the system will boot into the u-root and automatically kexec to the target OS.',
+
+            'Run /init as init process\n1970/01/01 00:00:10 Welcome to u-root!\n...',
+
+            "While the LinuxBoot implementation on the Ampere Mt. Jade platform represents a significant milestone, several advanced features and improvements remain to be explored. These enhancements would extend the platform's capabilities, improve its usability, and reinforce its position as a leading open source firmware solution. Key areas for future development include:",  # noqa: E501
+
+            'One of the critical areas for future development is enabling secure boot verification for the target operating system. In the LinuxBoot environment, the target OS is typically booted using kexec. However, it is unclear how Secure Boot operates in this context, as kexec bypasses traditional firmware-controlled secure boot mechanisms. Future work should investigate how to extend Secure Boot principles to kexec, ensuring that the OS kernel and its components are verified and authenticated before execution. This may involve implementing signature checks and utilizing trusted certificate chains directly within the LinuxBoot environment to mimic the functionality of UEFI Secure Boot during the kexec process.',  # noqa: E501
+
+            'The platform supports TPM, but its integration with LinuxBoot is yet to be defined. Future work could explore utilizing the TPM for secure boot measurements, and system integrity attestation.',  # noqa: E501
+
+            'Building on the success of LinuxBoot on Mt. Jade, future efforts should expand support to other Ampere platforms. This would ensure broader adoption and usability across different hardware configurations.',  # noqa: E501
+
+            'Improving the efficiency of the handoff between UEFI and LinuxBoot could further reduce boot times. This optimization would involve refining the initialization process and minimizing redundant operations during the handoff.',  # noqa: E501
+
+            'Adding more diagnostic and monitoring tools to the LinuxBoot u-root environment would enhance debugging and system management. These tools could provide deeper insights into system performance and potential issues, improving reliability and maintainability.',  # noqa: E501
+
+            '* [LinuxBoot on Ampere Platforms: A new (old) approach to firmware](https://amperecomputing.com/blogs/linuxboot-on-ampere-platforms--a-new-old-approach-to-firmware)']  # noqa: E501
+        for i in range(len(merged)):
+            assert merged[i].content == expected_merged[i]
+
+
+class TestXMLSplitter:
+    def test_basic_xml_split(self):
+        splitter = XMLSplitter(chunk_size=100, overlap=0, keep_tags=True, keep_trace=True)
+        xml_text = '''
+        <library>
+            <book id="1">
+                <title>Python Programming</title>
+                <author>John Doe</author>
+                <year>2023</year>
+            </book>
+            <book id="2">
+                <title>Data Science</title>
+                <author>Jane Smith</author>
+                <year>2024</year>
+            </book>
+        </library>
+        '''
+
+        nodes = splitter.split_text(xml_text, metadata_size=0)
+
+        assert len(nodes) > 0
+        for node in nodes:
+            assert 'tag' in node.metadata or 'xml_tag' in node.metadata
+            assert 'filetype' not in node.metadata
+
+    def test_xml_with_attributes(self):
+        splitter = XMLSplitter(chunk_size=100, overlap=0, keep_trace=True, keep_tags=True)
+        xml_text = '''
+        <root>
+            <element type="text" lang="en">Content here</element>
+            <element type="image" src="pic.jpg">Image description</element>
+        </root>
+        '''
+
+        nodes = splitter.split_text(xml_text, metadata_size=50)
+
+        has_attributes = any('attributes' in node.metadata for node in nodes)
+        assert has_attributes or len(nodes) > 0
+
+    def test_xml_keep_trace(self):
+        splitter = XMLSplitter(chunk_size=100, overlap=0, keep_trace=True)
+        xml_text = '''
+        <root>
+            <parent>
+                <child>Nested content</child>
+            </parent>
+        </root>
+        '''
+
+        nodes = splitter.split_text(xml_text, metadata_size=0)
+
+        has_trace = any('trace' in node.metadata for node in nodes)
+        assert has_trace
+
+    def test_xml_invalid(self):
+        splitter = XMLSplitter(chunk_size=100, overlap=0)
+        invalid_xml = '<unclosed><tag>'
+
+        nodes = splitter.split_text(invalid_xml, metadata_size=0)
+
+        assert len(nodes) == 1
+        assert 'error' in nodes[0].metadata
+
+
+class TestJSONSplitter:
+    def test_simple_json(self):
+        splitter = JSONSplitter(chunk_size=100, overlap=0, compact_output=True)
+        json_text = '{"name": "John", "age": 30, "city": "New York"}'
+
+        nodes = splitter.split_text(json_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'json' for node in nodes)
+
+    def test_json_dict_split(self):
+        splitter = JSONSplitter(chunk_size=80, overlap=0, compact_output=True)
+        json_text = '''{
+            "field1": "This is a very long text that might exceed chunk size when combined with other fields",
+            "field2": "Another long text field with substantial content",
+            "field3": "Short",
+            "field4": {"nested": "value"}
+        }'''
+
+        nodes = splitter.split_text(json_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        for node in nodes:
+            assert 'type' in node.metadata
+            assert 'path' in node.metadata
+            assert 'depth' in node.metadata
+
+    def test_json_array_split(self):
+        splitter = JSONSplitter(chunk_size=50, overlap=0, compact_output=True)
+        json_text = '''[
+            {"id": 1, "name": "Item 1", "desc": "Description 1"},
+            {"id": 2, "name": "Item 2", "desc": "Description 2"},
+            {"id": 3, "name": "Item 3", "desc": "Description 3"}
+        ]'''
+
+        nodes = splitter.split_text(json_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        has_list = any(node.metadata.get('type') == 'list' for node in nodes)
+        assert has_list or len(nodes) > 0
+
+    def test_json_nested_structure(self):
+        splitter = JSONSplitter(chunk_size=100, overlap=0, compact_output=True)
+        json_text = '''{
+            "user": {
+                "profile": {
+                    "name": "John",
+                    "bio": "A very long biography text that describes the user in detail"
+                },
+                "posts": [
+                    {"id": 1, "title": "Post 1", "content": "Content 1"},
+                    {"id": 2, "title": "Post 2", "content": "Content 2"}
+                ]
+            }
+        }'''
+
+        nodes = splitter.split_text(json_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        paths = [node.metadata.get('path') for node in nodes]
+        assert any(path for path in paths if path is not None)
+
+    def test_json_compact_vs_formatted(self):
+        json_text = '{"a": 1, "b": 2, "c": 3}'
+
+        splitter_compact = JSONSplitter(chunk_size=50, overlap=0, compact_output=True)
+        nodes_compact = splitter_compact.split_text(json_text, metadata_size=0)
+
+        splitter_formatted = JSONSplitter(chunk_size=50, overlap=0, compact_output=False)
+        nodes_formatted = splitter_formatted.split_text(json_text, metadata_size=0)
+
+        if len(nodes_compact) == 1 and len(nodes_formatted) == 1:
+            assert len(nodes_formatted[0].text) >= len(nodes_compact[0].text)
+
+    def test_json_invalid(self):
+        splitter = JSONSplitter(chunk_size=100, overlap=0)
+        invalid_json = '{invalid json'
+
+        nodes = splitter.split_text(invalid_json, metadata_size=0)
+
+        assert len(nodes) == 1
+        assert 'error' in nodes[0].metadata
+
+    def test_json_with_parent_field(self):
+        splitter = JSONSplitter(chunk_size=30, overlap=0, compact_output=True)
+        json_text = '''{
+            "long_field": "This is a very long text field that will be split into multiple parts because it exceeds the chunk size limit significantly",  # noqa: E501
+            "short_field": "This is a short text field"
+        }'''
+
+        nodes = splitter.split_text(json_text, metadata_size=0)
+        assert len(nodes) >= 1
+
+
+class TestJSONLSplitter:
+    def test_basic_jsonl(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''{"id": 1, "name": "Alice", "age": 30}
+                        {"id": 2, "name": "Bob", "age": 25}
+                        {"id": 3, "name": "Charlie", "age": 35}'''
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'jsonl' for node in nodes)
+
+    def test_jsonl_with_multiline_json(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''{
+                        "id": 1,
+                        "name": "Alice"
+                        }
+                        {
+                        "id": 2,
+                        "name": "Bob"
+                        }'''
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        for node in nodes:
+            assert 'count' in node.metadata or 'type' in node.metadata
+
+    def test_jsonl_with_escaped_newlines(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''{"id": 1, "text": "Line1\\nLine2\\nLine3"}\n{"id": 2, "text": "Hello\\nWorld"}'''
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_jsonl_with_empty_lines(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''{"id": 1, "name": "Alice"}\n{"id": 2, "name": "Bob"}\n{"id": 3, "name": "Charlie"}'''
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'jsonl' for node in nodes)
+
+    def test_jsonl_large_object(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        large_text = 'asdjgkahnkbn asvdkajasdasdl' * 200
+        jsonl_text = f'{{"id": 1, "data": "{large_text}"}}'
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        for node in nodes:
+            assert len(node.text) < 300
+
+    def test_jsonl_mixed_sizes(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        large_text = 'y' * 600
+        jsonl_text = f'''
+            {{"id": 1, "type": "small", "value": 100}}\n{{"id": 2, "type": "large", "data": "{large_text}"}}\n{{"id": 3, "type": "small", "value": 200}}\n  # noqa: E501
+            '''.strip()
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 2
+        has_batch = any('count' in node.metadata for node in nodes)
+        has_split = any('type' in node.metadata and node.metadata['type'] != 'dict' for node in nodes)
+        assert has_batch or has_split or len(nodes) > 1
+
+    def test_jsonl_with_code_splitter(self):
+        splitter = CodeSplitter(chunk_size=200, overlap=0, filetype='jsonl')
+        jsonl_text = '''{"id": 1, "name": "Alice"}\n{"id": 2, "name": "Bob"}'''
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'jsonl' for node in nodes)
+
+    def test_jsonl_nested_objects(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''{"id": 1, "nested": {"key": "value", "count": 42}}\n{"id": 2, "data": {"field1": "test", "field2": [1, 2, 3]}}'''  # noqa: E501
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'jsonl' for node in nodes)
+
+    def test_jsonl_arrays(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''[1, 2, 3, 4, 5]\n["apple", "banana", "cherry"]\n[{"id": 1}, {"id": 2}]'''  # noqa: E501
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'jsonl' for node in nodes)
+
+    def test_jsonl_special_characters(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = '''{"id": 1, "text": "Hello \\"World\\"", "emoji": "😀🎉"}\n{"id": 2, "chinese": "你好世界", "json_in_string": "{\\"nested\\": true}"}'''  # noqa: E501
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'jsonl' for node in nodes)
+
+    def test_jsonl_empty_input(self):
+        splitter = JSONLSplitter(chunk_size=200, overlap=0)
+        jsonl_text = ''
+
+        nodes = splitter.split_text(jsonl_text, metadata_size=0)
+
+        assert len(nodes) == 1
+        assert nodes[0].metadata.get('code_type') == 'empty' or 'count' in nodes[0].metadata
+
+    def test_jsonl_registered_in_code_splitter(self):
+        filetypes = CodeSplitter.get_supported_filetypes()
+
+        assert 'jsonl' in filetypes
+
+
+class TestYAMLSplitter:
+    def test_simple_yaml(self):
+        splitter = YAMLSplitter(chunk_size=100, overlap=0)
+        yaml_text = '''
+        name: MyProject
+        version: 1.0.0
+        description: A test project
+        '''
+
+        nodes = splitter.split_text(yaml_text, metadata_size=0)
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'yaml' for node in nodes)
+
+    def test_yaml_with_lists(self):
+        splitter = YAMLSplitter(chunk_size=80, overlap=0)
+        yaml_text = '''
+        dependencies:
+          - package1: "1.0.0"
+          - package2: "2.0.0"
+          - package3: "3.0.0"
+        config:
+          host: localhost
+          port: 8080
+        '''
+
+        nodes = splitter.split_text(yaml_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert any('path' in node.metadata for node in nodes)
+
+    def test_yaml_nested(self):
+        splitter = YAMLSplitter(chunk_size=100, overlap=0)
+        yaml_text = '''
+        server:
+          database:
+            host: localhost
+            port: 5432
+            credentials:
+              username: admin
+              password: secret
+          application:
+            name: MyApp
+            version: 2.0.0
+        '''
+
+        nodes = splitter.split_text(yaml_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_yaml_invalid(self):
+        splitter = YAMLSplitter(chunk_size=100, overlap=0)
+        invalid_yaml = '''
+        invalid:
+          - item1
+         - item2
+        '''
+
+        nodes = splitter.split_text(invalid_yaml, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+
+class TestHTMLSplitter:
+    def test_simple_html(self):
+        splitter = HTMLSplitter(chunk_size=100, overlap=0)
+        html_text = '''
+        <html>
+        <body>
+            <h1>Title</h1>
+            <p>This is a paragraph.</p>
+        </body>
+        </html>
+        '''
+
+        nodes = splitter.split_text(html_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata['filetype'] == 'html' for node in nodes)
+
+    def test_html_with_sections(self):
+        splitter = HTMLSplitter(chunk_size=200, overlap=0, keep_sections=True)
+        html_text = '''
+        <html>
+        <body>
+            <header>
+                <h1>Website Header</h1>
+            </header>
+            <main>
+                <article>
+                    <h2>Article Title</h2>
+                    <p>Article content goes here.</p>
+                </article>
+            </main>
+            <footer>
+                <p>Footer content</p>
+            </footer>
+        </body>
+        </html>
+        '''
+
+        nodes = splitter.split_text(html_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        has_section_type = any('section_type' in node.metadata for node in nodes)
+        assert has_section_type
+
+    def test_html_with_headings(self):
+        splitter = HTMLSplitter(chunk_size=150, overlap=0)
+        html_text = '''
+        <html>
+        <body>
+            <h1>Main Title</h1>
+            <p>Introduction paragraph.</p>
+            <h2>Section 1</h2>
+            <p>Section 1 content.</p>
+            <h2>Section 2</h2>
+            <p>Section 2 content.</p>
+        </body>
+        </html>
+        '''
+
+        nodes = splitter.split_text(html_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        has_heading = any(node.metadata.get('has_heading') for node in nodes)
+        assert has_heading or len(nodes) > 0
+
+    def test_html_with_divs(self):
+        splitter = HTMLSplitter(chunk_size=150, overlap=0)
+        html_text = '''
+        <html>
+        <body>
+            <div class="container">
+                <div class="content">
+                    <p>Content 1</p>
+                </div>
+                <div class="sidebar">
+                    <p>Sidebar content</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        '''
+
+        nodes = splitter.split_text(html_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_html_script_removal(self):
+        splitter = HTMLSplitter(chunk_size=200, overlap=0)
+        html_text = '''
+        <html>
+        <head>
+            <style>body { color: red; }</style>
+        </head>
+        <body>
+            <p>Visible content</p>
+            <script>console.log('test');</script>
+        </body>
+        </html>
+        '''
+
+        nodes = splitter.split_text(html_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        for node in nodes:
+            assert 'console.log' not in node.text
+            assert 'color: red' not in node.text
+
+    def test_html_invalid(self):
+        splitter = HTMLSplitter(chunk_size=100, overlap=0)
+        invalid_html = '<div><p>Unclosed tags'
+
+        nodes = splitter.split_text(invalid_html, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+
+class TestGeneralCodeSplitter:
+    def test_python_code(self):
+        splitter = GeneralCodeSplitter(chunk_size=200, overlap=0, filetype='python')
+        code = '''
+            def function1():
+                print("Hello")
+                return True
+
+            def function2(x, y):
+                result = x + y
+                return result
+
+            class MyClass:
+                def __init__(self):
+                    self.value = 0
+
+                def method(self):
+                    return self.value
+            '''
+
+        nodes = splitter.split_text(code, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert all(node.metadata.get('code_type') in ['code_block', 'code_structure', 'code_file']
+                   for node in nodes)
+
+    def test_class_structure(self):
+        splitter = GeneralCodeSplitter(chunk_size=150, overlap=0, filetype='python')
+        code = '''
+            class Example:
+                def __init__(self, name):
+                    self.name = name
+
+                def greet(self):
+                    print(f"Hello, {self.name}")
+            '''
+
+        nodes = splitter.split_text(code, metadata_size=0)
+
+        assert len(nodes) >= 1
+        has_structure = any(node.metadata.get('code_type') == 'code_structure'
+                            for node in nodes)
+        assert has_structure or len(nodes) > 0
+
+    def test_control_structures(self):
+        splitter = GeneralCodeSplitter(chunk_size=100, overlap=0, filetype='python')
+        code = '''
+            if condition:
+                do_something()
+            elif other_condition:
+                do_other_thing()
+            else:
+                do_default()
+
+            for i in range(10):
+                print(i)
+
+            while True:
+                break
+            '''
+
+        nodes = splitter.split_text(code, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_empty_code(self):
+        splitter = GeneralCodeSplitter(chunk_size=100, overlap=0, filetype='python')
+        code = ''
+
+        nodes = splitter.split_text(code, metadata_size=0)
+
+        assert len(nodes) == 1
+        assert nodes[0].metadata['code_type'] == 'empty'
+
+
+class TestCodeSplitter:
+    def test_xml_filetype(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='xml')
+        xml_text = '<root><item>test</item></root>'
+
+        nodes = splitter.split_text(xml_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_json_filetype(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='json')
+        json_text = '{"key": "value"}'
+
+        nodes = splitter.split_text(json_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert nodes[0].metadata['filetype'] == 'json'
+
+    def test_yaml_filetype(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='yaml')
+        yaml_text = 'key: value\nlist:\n  - item1\n  - item2'
+
+        nodes = splitter.split_text(yaml_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert nodes[0].metadata['filetype'] == 'yaml'
+
+    def test_html_filetype(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='html')
+        html_text = '<html><body><p>test</p></body></html>'
+
+        nodes = splitter.split_text(html_text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert nodes[0].metadata['filetype'] == 'html'
+
+    def test_programming_fallback(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='python')
+        code = 'def test():\n    pass'
+
+        nodes = splitter.split_text(code, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_no_filetype(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0)
+        text = 'some text'
+
+        nodes = splitter.split_text(text, metadata_size=0)
+
+        assert len(nodes) >= 1
+        assert nodes[0].metadata.get('tag') == 'unknown_type'
+
+    def test_get_supported_filetypes(self):
+        filetypes = CodeSplitter.get_supported_filetypes()
+
+        assert 'xml' in filetypes
+        assert 'json' in filetypes
+        assert 'yaml' in filetypes
+        assert 'yml' in filetypes
+        assert 'html' in filetypes
+        assert 'htm' in filetypes
+
+    def test_register_custom_splitter(self):
+        class CustomSplitter(GeneralCodeSplitter):
+            pass
+
+        CodeSplitter.register_splitter('custom', CustomSplitter)
+
+        filetypes = CodeSplitter.get_supported_filetypes()
+        assert 'custom' in filetypes
+
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='custom')
+        text = 'test content'
+        nodes = splitter.split_text(text, metadata_size=0)
+
+        assert len(nodes) >= 1
+
+    def test_batch_forward_with_docnode(self):
+        splitter = CodeSplitter(chunk_size=100, overlap=0, filetype='json')
+        json_text = '{"name": "test", "value": 123}'
+
+        doc_node = DocNode(text=json_text)
+        nodes = splitter.batch_forward([doc_node], node_group='test')
+
+        assert len(nodes) >= 1
+
+
+class TestSetDefaultIntegration:
+    def test_json_splitter_set_default(self):
+        JSONSplitter.set_default(chunk_size=512, compact_output=False)
+        splitter = JSONSplitter()
+        assert splitter._chunk_size == 512
+        assert splitter._compact_output is False
+        JSONSplitter.reset_default()
+
+    def test_html_splitter_set_default(self):
+        HTMLSplitter.set_default(chunk_size=256, keep_sections=True)
+
+        splitter = HTMLSplitter()
+
+        assert splitter._chunk_size == 256
+        assert splitter._keep_sections is True
+
+        HTMLSplitter.reset_default()
+
+    def test_xml_splitter_set_default(self):
+        XMLSplitter.set_default(keep_trace=True, keep_tags=True)
+
+        splitter = XMLSplitter()
+
+        assert splitter._keep_trace is True
+        assert splitter._keep_tags is True
+
+        XMLSplitter.reset_default()
+
+
+class TestTextSplitterBase:
+    def test_token_size(self):
+        splitter = _TextSplitterBase(chunk_size=5, overlap=0)
+        text = 'Hello, world! This is a test.'
+        token_size = splitter._token_size(text)
+        assert token_size == 9
+
+    def test_invalid_chunk_overlap(self):
+        with pytest.raises(ValueError):
+            _TextSplitterBase(chunk_size=2, overlap=10)
+
+    def test_split(self):
+        splitter = _TextSplitterBase(chunk_size=5, overlap=0)
+        text = 'Hello, world! This is a test.'
+        splits = splitter._split(text, chunk_size=5)
+        assert splits == [
+            _Split(text='Hello, world!', is_sentence=True, token_size=4),
+            _Split(text='This is a test.', is_sentence=True, token_size=5),
+        ]
+
+    def test_merge(self):
+        splitter = _TextSplitterBase(chunk_size=5, overlap=0)
+        splits = [
+            _Split(text='Hello, world!', is_sentence=True, token_size=4),
+            _Split(text='This is a test.', is_sentence=True, token_size=5),
+        ]
+        merged = splitter._merge(splits, chunk_size=5)
+        assert merged == ['Hello, world!', 'This is a test.']
+
+    def test_split_text(self):
+        splitter = _TextSplitterBase(chunk_size=5, overlap=0)
+        text = 'Hello, world! This is a test.'
+        splits = splitter.split_text(text, metadata_size=0)
+        assert splits == ['Hello, world!', 'This is a test.']
+
+    def test_empty_text(self):
+        splitter = _TextSplitterBase(chunk_size=20, overlap=10)
+        chunks = splitter.split_text('', metadata_size=0)
+        assert chunks == ['']
+
+    def test_overlap_behavior(self):
+        splitter = _TextSplitterBase(chunk_size=10, overlap=2)
+        text = 'abcdefghijabcdefghij'
+        splits = [
+            _Split(text[:10], is_sentence=True, token_size=len(splitter.token_encoder(text[:10]))),
+            _Split(text[10:14], is_sentence=True, token_size=len(splitter.token_encoder(text[10:14]))),
+            _Split(text[14:], is_sentence=True, token_size=len(splitter.token_encoder(text[14:])))
+        ]
+        chunks = splitter._merge(splits, chunk_size=10)
+        assert len(chunks) >= 2
+        assert splitter.token_encoder(chunks[0])[-2:] == splitter.token_encoder(chunks[1])[:2]
+
+    def test_metadata_size_limit(self, doc_node):
+        splitter = _TextSplitterBase(chunk_size=20, overlap=10)
+        doc_node.get_metadata_str.return_value = 'x' * 100
+        with pytest.raises(ValueError):
+            splitter.split_text('短文本', metadata_size=200)
+
+    def test_get_splits_by_fns(self):
+        splitter = _TextSplitterBase(chunk_size=5, overlap=0)
+        text = 'Hello, world! This is a test.'
+        splits, is_sentence = splitter._get_splits_by_fns(text)
+        assert splits == ['Hello, world!', 'This is a test.']
+        assert is_sentence is True
+
+    def test_get_metadata_size(self):
+        splitter = _TextSplitterBase(chunk_size=20, overlap=10)
+        node = DocNode(text='Hello, world! This is a test.')
+        metadata_size = splitter._get_metadata_size(node)
+        assert metadata_size == 0
+
+    def test_get_metadata_size_respects_excluded_metadata_keys(self):
+        splitter = _TextSplitterBase(chunk_size=200, overlap=10)
+        node = DocNode(
+            text='Hello, world! This is a test.',
+            metadata={
+                'file_name': 'test.pdf',
+                'title': 'Section 1',
+                'lines': [{'content': 'x' * 2000, 'page': 1}],
+            },
+        )
+        node.excluded_embed_metadata_keys = ['lines']
+        node.excluded_llm_metadata_keys = ['lines']
+
+        metadata_size = splitter._get_metadata_size(node)
+
+        assert metadata_size < 200
+
+    def test_transform_returns_chunks(self, doc_node):
+        splitter = _TextSplitterBase(chunk_size=20, overlap=10)
+        chunks = splitter([doc_node])
+        assert isinstance(chunks, list)
+        assert all(isinstance(c, DocNode) for c in chunks)
+
+    def test_batch_forward_single(self, doc_node):
+        splitter = _TextSplitterBase(chunk_size=20, overlap=10)
+        doc_node.children = {}
+        result = splitter.batch_forward(doc_node, node_group='test')
+        assert isinstance(result, list)
+        assert all(hasattr(c, 'text') for c in result)
+        assert 'test' in doc_node.children
+
+    def test_from_tiktoken_encoder_basic(self):
+        splitter = _TextSplitterBase(chunk_size=100, overlap=20)
+
+        result = splitter.from_tiktoken_encoder(encoding_name='gpt2')
+        assert result is splitter
+        assert splitter.token_encoder is not None
+        assert splitter.token_decoder is not None
+
+    def test_from_tiktoken_encoder_with_model_name(self):
+        splitter = _TextSplitterBase(chunk_size=100, overlap=20)
+
+        result = splitter.from_tiktoken_encoder(model_name='gpt-3.5-turbo')
+
+        assert result is splitter
+        assert splitter.token_encoder is not None
+        assert splitter.token_decoder is not None
+
+    def test_from_tiktoken_encoder_encoding_decoding(self):
+        splitter = _TextSplitterBase(chunk_size=100, overlap=20)
+        splitter.from_tiktoken_encoder(encoding_name='gpt2')
+        text = 'Hello, world!'
+        encoded = splitter.token_encoder(text)
+        assert isinstance(encoded, list)
+        assert len(encoded) > 0
+
+    def test_from_tiktoken_encoder_token_size(self):
+        splitter = _TextSplitterBase(chunk_size=100, overlap=20)
+        splitter.from_tiktoken_encoder(encoding_name='gpt2')
+
+        text = 'This is a test sentence.'
+        token_size = splitter._token_size(text)
+
+        assert isinstance(token_size, int)
+        assert token_size > 0
+
+    def test_from_tiktoken_encoder_chaining(self):
+        splitter = _TextSplitterBase(chunk_size=100, overlap=20)
+
+        result = splitter.from_tiktoken_encoder(encoding_name='gpt2')
+
+        text = 'Test text'
+        chunks = result.split_text(text, metadata_size=0)
+        assert chunks == ['Test text']
+
+
+class TestTokenTextSplitter:
+    def test_token_splitter_basic(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'hello world'
+        splits = token_splitter._split(text, chunk_size=10)
+        assert isinstance(splits, list)
+        assert all(isinstance(s, _Split) for s in splits)
+
+    def test_token_splitter_overlap_behavior(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'abcdefghijabcdefghij'
+        splits = token_splitter._split(text, chunk_size=10)
+        chunks = token_splitter._merge(splits, chunk_size=10)
+        assert len(chunks) == 1
+        assert chunks[0] == 'abcdefghijabcdefghij'
+
+    def test_token_splitter_exact_overlap(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'abcdefghijabcdefghij'
+        chunks = token_splitter.split_text(text, metadata_size=0)
+        assert len(chunks) >= 1
+        assert chunks[0] == 'abcdefghijabcdefghij'
+
+    def test_token_splitter_short_text(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'short'
+        chunks = token_splitter.split_text(text, metadata_size=0)
+        assert len(chunks) == 1
+        assert chunks[0] == 'short'
+
+    def test_token_splitter_exact_chunk_size(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'a' * 10
+        chunks = token_splitter.split_text(text, metadata_size=0)
+        assert len(chunks) == 1
+        assert chunks[0] == text
+
+    def test_token_splitter_large_text(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'a' * 50
+        chunks = token_splitter.split_text(text, metadata_size=0)
+        assert len(chunks) > 1
+
+        for i in range(len(chunks) - 1):
+            assert chunks[i][-3:] == chunks[i + 1][:3]
+
+    def test_token_splitter_merge_returns_text_only(self):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        text = 'abcdefghijklmnopqrst'
+        splits = token_splitter._split(text, chunk_size=10)
+        merged = token_splitter._merge(splits, chunk_size=10)
+
+        assert isinstance(merged, list)
+        assert all(isinstance(m, str) for m in merged)
+
+    def test_token_splitter_transform_with_docnode(self, doc_node):
+        token_splitter = _TokenTextSplitter(chunk_size=10, overlap=3)
+        chunks = token_splitter([doc_node])
+        assert isinstance(chunks, list)
+        assert all(isinstance(c, DocNode) for c in chunks)
+
+    def test_token_text_splitter_with_tiktoken(self):
+        splitter = _TokenTextSplitter(chunk_size=10, overlap=5)
+        splitter.from_tiktoken_encoder(encoding_name='gpt2')
+
+        text = 'This is a test sentence that needs to be split into multiple chunks.'
+        chunks = splitter.split_text(text, metadata_size=0)
+
+        assert isinstance(chunks, list)
+        assert len(chunks) > 1
+
+        for i in range(len(chunks) - 1):
+            tokens1 = splitter.token_encoder(chunks[i])
+            tokens2 = splitter.token_encoder(chunks[i + 1])
+
+            overlap_size = min(5, len(tokens1), len(tokens2))
+            if overlap_size > 0:
+                assert tokens1[-overlap_size:] == tokens2[:overlap_size]
+
+
+class TestDocumentSplit:
+    def setup_method(self):
+        document = Document(
+            dataset_path='rag_master',
+            manager=False
+        )
+        document.create_node_group(
+            name='sentence_test',
+            transform=SentenceSplitter,
+            chunk_size=128,
+            chunk_overlap=10
+        )
+        document.create_node_group(
+            name='character_test',
+            transform=CharacterSplitter,
+            chunk_size=128,
+            overlap=0,
+            separator=',',
+            keep_separator=True
+        )
+        document.create_node_group(
+            name='recursive_test',
+            transform=RecursiveSplitter,
+            chunk_size=128,
+            overlap=0,
+            separators=['\n\n', '\n', '.', ' ']
+        )
+
+        query = '何为天道？'
+
+        self.document = document
+        self.query = query
+
+    def test_sentence_split(self):
+        document = self.document
+        document.activate_groups('sentence_test')
+        document.start()
+        retriever = Retriever(document, group_name='sentence_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+    def test_character_split(self):
+        document = self.document
+        document.activate_groups('character_test')
+        document.start()
+        retriever = Retriever(document, group_name='character_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+    def test_recursive_split(self):
+        document = self.document
+        document.activate_groups('recursive_test')
+        document.start()
+        retriever = Retriever(document, group_name='recursive_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+
+class TestDocumentChainSplit:
+    def setup_method(self):
+        document = Document(
+            dataset_path='rag_master',
+            manager=False
+        )
+        document.create_node_group(
+            name='sentence_test',
+            transform=SentenceSplitter,
+            chunk_size=128,
+            chunk_overlap=10
+        )
+        document.create_node_group(
+            name='recursive_test',
+            transform=RecursiveSplitter,
+            chunk_size=128,
+            overlap=0,
+            parent='sentence_test'
+        )
+        document.create_node_group(
+            name='character_test',
+            transform=CharacterSplitter,
+            chunk_size=128,
+            overlap=0,
+            separator=' ',
+            parent='recursive_test'
+        )
+
+        query = '何为天道？'
+
+        self.document = document
+        self.query = query
+
+    def test_sentence_split(self):
+        document = self.document
+        document.activate_groups('sentence_test')
+        document.start()
+        retriever = Retriever(document, group_name='sentence_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+    def test_recursive_split(self):
+        document = self.document
+        document.activate_groups('recursive_test')
+        document.start()
+        retriever = Retriever(document, group_name='recursive_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+    def test_character_split(self):
+        document = self.document
+        document.activate_groups('character_test')
+        document.start()
+        retriever = Retriever(document, group_name='character_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+
+class TestDIYDocumentSplit:
+    def setup_method(self):
+        document = Document(
+            dataset_path='rag_master',
+            manager=False
+        )
+        document.create_node_group(
+            name='sentence_test',
+            transform=SentenceSplitter,
+            chunk_size=128,
+            chunk_overlap=10
+        )
+        splitter = CharacterSplitter(chunk_size=128, overlap=10, separator=' ')
+        splitter.set_split_fns([lambda x: x.split(' ')])
+        document.create_node_group(
+            name='character_test',
+            transform=splitter,
+            parent='sentence_test')
+
+        query = '何为天道？'
+
+        self.document = document
+        self.query = query
+
+    def test_character_split(self):
+        document = self.document
+        document.activate_groups('character_test')
+        document.start()
+        retriever = Retriever(document, group_name='character_test', similarity='bm25', topk=3)
+        doc_node_list = retriever(query=self.query)
+        assert len(doc_node_list) == 3
+
+
+class TestContentFiltParser:
+    def setup_method(self):
+        self.filter_parser = ContentFiltParser()
+
+    def test_filter_empty_nodes(self):
+        nodes = [
+            DocNode(text='Hello'),
+            DocNode(text=''),
+            DocNode(text='   '),
+            DocNode(text='World'),
+            DocNode(text='\n\n'),
+        ]
+        result = self.filter_parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == 2
+        assert result[0].text == 'Hello'
+        assert result[1].text == 'World'
+
+    def test_filter_with_custom_rules(self):
+        rule = RuleSet([Rule.build(
+            'short_filter',
+            rule=lambda n: len(n.text) >= 5,
+            apply=lambda n, r: n,
+        )])
+        filter_parser = ContentFiltParser(rules=rule)
+        nodes = [
+            DocNode(text='Hello'),
+            DocNode(text='World'),
+            DocNode(text='Hi'),
+        ]
+        result = filter_parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == 2
+
+    def test_single_node(self):
+        node = DocNode(text='Test')
+        result = self.filter_parser.forward(node)
+        assert len(result) == 1
+        assert result[0].text == 'Test'
+
+
+class TestGroupNodeParser:
+    def setup_method(self):
+        self.parser = GroupNodeParser()
+
+    def test_group_by_level(self):
+        nodes = [
+            DocNode(text='Title', metadata={'text_level': 1}),
+            DocNode(text='Content 1', metadata={'text_level': 0}),
+            DocNode(text='Content 2', metadata={'text_level': 0}),
+            DocNode(text='Subtitle', metadata={'text_level': 2}),
+            DocNode(text='Content 3', metadata={'text_level': 0}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) > 0
+
+    def test_empty_list(self):
+        result = self.parser.forward(RichDocNode(nodes=[]))
+        assert result == []
+
+    def test_single_node(self):
+        nodes = [DocNode(text='Only one', metadata={'text_level': 0})]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+    def test_merge_title(self):
+        parser = GroupNodeParser(merge_title=True)
+        nodes = [
+            DocNode(text='Title', metadata={'text_level': 1}),
+            DocNode(text='Content', metadata={'text_level': 0}),
+        ]
+        result = parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+
+class TestLayoutNodeParser:
+    def setup_method(self):
+        self.parser = LayoutNodeParser()
+
+    def test_default_group_by_filename(self):
+        nodes = [
+            DocNode(text='Page 1', metadata={'file_name': 'doc1.pdf', 'index': 2}),
+            DocNode(text='Page 2', metadata={'file_name': 'doc1.pdf', 'index': 1}),
+            DocNode(text='Page 3', metadata={'file_name': 'doc2.pdf', 'index': 1}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == 3
+        assert result[0].metadata['index'] == 0
+        assert result[1].metadata['index'] == 1
+
+    def test_no_grouping(self):
+        parser = LayoutNodeParser(group_by=NO_GROUPING)
+        nodes = [
+            DocNode(text='A', metadata={'index': 3}),
+            DocNode(text='B', metadata={'index': 1}),
+            DocNode(text='C', metadata={'index': 2}),
+        ]
+        result = parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == 3
+        assert result[0].text == 'B'
+        assert result[1].text == 'C'
+        assert result[2].text == 'A'
+
+    def test_custom_group_by(self):
+        parser = LayoutNodeParser(group_by=lambda n: n.metadata.get('category', ''))
+        nodes = [
+            DocNode(text='A', metadata={'category': 'cat1', 'index': 1}),
+            DocNode(text='B', metadata={'category': 'cat2', 'index': 1}),
+            DocNode(text='C', metadata={'category': 'cat1', 'index': 0}),
+        ]
+        result = parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == 3
+
+    def test_custom_sort_by(self):
+        parser = LayoutNodeParser(sort_by=lambda n: n.metadata.get('page_num', 0))
+        nodes = [
+            DocNode(text='Page 3', metadata={'file_name': 'doc.pdf', 'page_num': 3}),
+            DocNode(text='Page 1', metadata={'file_name': 'doc.pdf', 'page_num': 1}),
+            DocNode(text='Page 2', metadata={'file_name': 'doc.pdf', 'page_num': 2}),
+        ]
+        result = parser.forward(RichDocNode(nodes=nodes))
+        assert result[0].text == 'Page 1'
+        assert result[1].text == 'Page 2'
+        assert result[2].text == 'Page 3'
+
+
+class TestTreeBuilderParser:
+    def setup_method(self):
+        self.parser = TreeBuilderParser()
+
+    def test_build_simple_tree(self):
+        nodes = [
+            DocNode(text='1. Title', metadata={'text_level': 1}),
+            DocNode(text='1.1 Subtitle', metadata={'text_level': 2}),
+            DocNode(text='1.2 Subtitle', metadata={'text_level': 2}),
+            DocNode(text='2. Title', metadata={'text_level': 1}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+    def test_flat_nodes(self):
+        nodes = [
+            DocNode(text='Content without level'),
+            DocNode(text='Another content'),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == 2
+
+    def test_empty_list(self):
+        result = self.parser.forward(RichDocNode(nodes=[]))
+        assert result == []
+
+    def test_custom_get_level(self):
+        parser = TreeBuilderParser(get_level=lambda n: n.metadata.get('level', 0))
+        nodes = [
+            DocNode(text='Level 1', metadata={'level': 1}),
+            DocNode(text='Level 2', metadata={'level': 2}),
+        ]
+        result = parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) == len(nodes)
+
+
+class TestTreeFixerParser:
+    def setup_method(self):
+        self.parser = TreeFixerParser()
+
+    def test_fix_digit_numbering(self):
+        nodes = [
+            DocNode(text='1. First', metadata={'text_level': 1}),
+            DocNode(text='2. Second', metadata={'text_level': 1}),
+            DocNode(text='3. Third', metadata={'text_level': 1}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+    def test_fix_chinese_numbering(self):
+        nodes = [
+            DocNode(text='一、第一条', metadata={'text_level': 1}),
+            DocNode(text='二、第二条', metadata={'text_level': 1}),
+            DocNode(text='三、第三条', metadata={'text_level': 1}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+    def test_fix_multilevel(self):
+        nodes = [
+            DocNode(text='1. First', metadata={'text_level': 1}),
+            DocNode(text='1.1 Sub first', metadata={'text_level': 2}),
+            DocNode(text='1.2 Sub second', metadata={'text_level': 2}),
+            DocNode(text='2. Second', metadata={'text_level': 1}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+    def test_empty_list(self):
+        result = self.parser.forward(RichDocNode(nodes=[]))
+        assert result == []
+
+    def test_skip_level_under(self):
+        parser = TreeFixerParser(skip_level_under=2)
+        nodes = [
+            DocNode(text='Level 1', metadata={'text_level': 1}),
+            DocNode(text='Level 2', metadata={'text_level': 2}),
+        ]
+        result = parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+    def test_with_children(self):
+        nodes = [
+            DocNode(text='1. Title', metadata={'text_level': 1, 'children': [
+                DocNode(text='Child 1', metadata={'text_level': 2}),
+                DocNode(text='Child 2', metadata={'text_level': 2}),
+            ]}),
+        ]
+        result = self.parser.forward(RichDocNode(nodes=nodes))
+        assert len(result) >= 1
+
+
+class TestBatchForwardRefPath:
+    class _CollectRefTransform(NodeTransform):
+        __support_rich__ = True
+
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, node, **kwargs):
+            nodes = node.nodes if isinstance(node, RichDocNode) else [node]
+            self.calls.append([n.text for n in nodes])
+            return [DocNode(text=f'out-{n.text}') for n in nodes]
+
+    def test_batch_forward_uses_ref_path_per_parent(self):
+        transform = self._CollectRefTransform()
+        doc_a = DocNode(text='doc-a', global_metadata={RAG_DOC_ID: 'doc-a'})
+        doc_b = DocNode(text='doc-b', global_metadata={RAG_DOC_ID: 'doc-b'})
+        doc_a.children['section'] = [DocNode(text='a1'), DocNode(text='a2')]
+        doc_b.children['section'] = [DocNode(text='b1'), DocNode(text='b2')]
+
+        outputs = transform.batch_forward(
+            [doc_a, doc_b], node_group='layout_test', ref_path=['section']
+        )
+        assert len(transform.calls) == 2
+        assert transform.calls[0] == ['a1', 'a2']
+        assert transform.calls[1] == ['b1', 'b2']
+        assert [n.text for n in doc_a.children['layout_test']] == ['out-a1', 'out-a2']
+        assert [n.text for n in doc_b.children['layout_test']] == ['out-b1', 'out-b2']
+        assert len(outputs) == 4
+
+    def test_batch_forward_rich_doc_node_no_ref_path(self):
+        transform = self._CollectRefTransform()
+        n1, n2, n3 = DocNode(text='p1'), DocNode(text='p2'), DocNode(text='p3')
+        rich = RichDocNode(nodes=[n1, n2, n3])
+        outputs = transform.batch_forward([rich], node_group='chunk')
+        assert len(transform.calls) == 1
+        assert transform.calls[0] == ['p1', 'p2', 'p3']
+        assert len(rich.children['chunk']) == 3
+        assert [n.text for n in rich.children['chunk']] == ['out-p1', 'out-p2', 'out-p3']
+        assert len(outputs) == 3
+
+    def test_batch_forward_rich_doc_node_with_ref_path(self):
+        transform = self._CollectRefTransform()
+        a1, a2 = DocNode(text='a1'), DocNode(text='a2')
+        rich = RichDocNode(nodes=[DocNode(text='dummy')])
+        rich.children['section'] = [a1, a2]
+        outputs = transform.batch_forward([rich], node_group='out', ref_path=['section'])
+        assert len(transform.calls) == 1
+        assert transform.calls[0] == ['a1', 'a2']
+        assert [n.text for n in rich.children['out']] == ['out-a1', 'out-a2']
+        assert len(outputs) == 2
+
+    def test_parsing_service_ref_path_maintained_in_add_doc(self):
+        recorded_groups_per_call = []
+        recorded_doc_ids_per_call = []
+
+        class SectionTransform(NodeTransform):
+            def forward(self, node, **kwargs):
+                nodes = node.nodes if isinstance(node, RichDocNode) else [node]
+                out = []
+                for n in nodes:
+                    out.append(DocNode(text=f'{n.text}-s1'))
+                    out.append(DocNode(text=f'{n.text}-s2'))
+                return out
+
+        class RefConsumerTransform(NodeTransform):
+            __support_rich__ = True
+
+            def forward(self, node, **kwargs):
+                nodes = node.nodes if isinstance(node, RichDocNode) else [node]
+                recorded_groups_per_call.append([getattr(n, '_group', None) or getattr(n, 'group', None) for n in nodes])
+                recorded_doc_ids_per_call.append([n.global_metadata.get(RAG_DOC_ID) for n in nodes])
+                return [DocNode(text=f'ref-{n.text}') for n in nodes]
+
+        store = _DocumentStore(store={'type': 'map'}, embed={})
+        store.impl.need_embedding = False
+        store.activate_group(LAZY_ROOT_NAME)
+        store.activate_group('section')
+        store.activate_group('group_with_ref')
+
+        node_groups = {
+            LAZY_ROOT_NAME: {'parent': '', 'transform': None, 'ref': None},
+            'section': {
+                'parent': LAZY_ROOT_NAME,
+                'transform': TransformArgs(f=SectionTransform),
+                'ref': None,
+            },
+            'group_with_ref': {
+                'parent': LAZY_ROOT_NAME,
+                'ref': 'section',
+                'transform': TransformArgs(f=RefConsumerTransform),
+            },
+        }
+
+        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f1, \
+             tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f2:
+            p1, p2 = f1.name, f2.name
+        try:
+            id1, id2 = gen_docid(p1), gen_docid(p2)
+            root1 = DocNode(text='d1', group=LAZY_ROOT_NAME,
+                            global_metadata={RAG_DOC_ID: id1, RAG_KB_ID: 'default'})
+            root2 = DocNode(text='d2', group=LAZY_ROOT_NAME,
+                            global_metadata={RAG_DOC_ID: id2, RAG_KB_ID: 'default'})
+            reader = MagicMock()
+            reader.load_data.return_value = {
+                LAZY_ROOT_NAME: [root1, root2],
+                LAZY_IMAGE_GROUP: [],
+            }
+
+            processor = _Processor(
+                store=store,
+            )
+            processor.add_doc(input_files=[p1, p2], node_groups=node_groups, reader=reader,
+                              ids=[id1, id2], metadatas=[{}, {}])
+
+            assert len(recorded_groups_per_call) == 2
+            assert recorded_groups_per_call[0] == ['section', 'section']
+            assert recorded_groups_per_call[1] == ['section', 'section']
+            assert recorded_doc_ids_per_call[0] == [id1, id1]
+            assert recorded_doc_ids_per_call[1] == [id2, id2]
+        finally:
+            for p in (p1, p2):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_prepare_doc_inputs_handles_empty_input_files(self):
+        ids, metadatas, kb_id = _Processor._prepare_doc_inputs([])
+
+        assert ids == []
+        assert metadatas == []
+        assert kb_id == DEFAULT_KB_ID
+
+    def test_reparse_allows_missing_metadatas(self):
+        doc_path = '/tmp/reparse.txt'
+        doc_id = 'doc-1'
+        reader = MagicMock()
+        reader.load_data.return_value = {
+            LAZY_ROOT_NAME: [],
+            LAZY_IMAGE_GROUP: [],
+        }
+        store = MagicMock()
+        store.get_nodes.return_value = []
+        processor = _Processor(store=store)
+        processor.add_doc = MagicMock()
+
+        processor._reparse_docs(group_name='all', node_groups={}, reader=reader,
+                                doc_ids=[doc_id], doc_paths=[doc_path], metadatas=None)
+
+        reader.load_data.assert_called_once_with(
+            [doc_path],
+            [{RAG_DOC_ID: doc_id, RAG_DOC_PATH: doc_path, RAG_KB_ID: DEFAULT_KB_ID}],
+            split_nodes_by_type=True,
+        )
+        processor.add_doc.assert_called_once_with(
+            input_files=[doc_path],
+            ids=[doc_id],
+            metadatas=[{RAG_DOC_ID: doc_id, RAG_DOC_PATH: doc_path, RAG_KB_ID: DEFAULT_KB_ID}],
+            kb_id=DEFAULT_KB_ID,
+            node_groups={},
+            reader=reader,
+            preloaded_root_nodes=reader.load_data.return_value,
+        )
+
+
+class TestCallableSig:
+    def test_named_function_is_stable(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        def my_func(x):
+            return x + 1
+
+        sig1 = _callable_sig(my_func)
+        sig2 = _callable_sig(my_func)
+        assert sig1 == sig2
+        # nested function uses bytecode path
+        assert sig1.startswith('__bytecode__::')
+
+    def test_top_level_named_function_uses_qualname(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+        from lazyllm.tools.rag.transform import SentenceSplitter
+
+        sig = _callable_sig(SentenceSplitter.forward)
+        assert sig.startswith('lazyllm.')
+        assert '.' in sig  # module.qualname format
+
+    def test_lambda_in_file_is_stable(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        f = lambda x: x.endswith('.txt')  # noqa: E731
+        sig1 = _callable_sig(f)
+        sig2 = _callable_sig(f)
+        assert sig1 == sig2
+        assert sig1.startswith('__bytecode__::')
+
+    def test_same_lambda_body_same_sig(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        f1 = lambda x: x.endswith('.txt')  # noqa: E731
+        f2 = lambda x: x.endswith('.txt')  # noqa: E731
+        assert _callable_sig(f1) == _callable_sig(f2)
+
+    def test_different_lambda_body_different_sig(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        f1 = lambda x: x.endswith('.txt')  # noqa: E731
+        f2 = lambda x: x.endswith('.md')   # noqa: E731
+        assert _callable_sig(f1) != _callable_sig(f2)
+
+    def test_none_returns_default(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        assert _callable_sig(None) == '__default__'
+
+    def test_name_override(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        f = lambda x: x  # noqa: E731
+        assert _callable_sig(f, name_override='my_name') == 'my_name'
+
+    def test_pipeline_instance_is_stable(self):
+        from lazyllm.tools.rag.transform.factory import _callable_sig
+
+        pipeline = lazyllm.pipeline(SentenceSplitter(chunk_size=128, chunk_overlap=10))
+        sig1 = _callable_sig(pipeline)
+        sig2 = _callable_sig(pipeline)
+        assert sig1 == sig2
+        assert sig1 == '__unstable__'
+
+    def test_transform_args_signature_with_lambda_pattern(self):
+        ta1 = TransformArgs(f=SentenceSplitter, pattern=lambda x: x.endswith('.txt'),
+                            kwargs=dict(chunk_size=512))
+        ta2 = TransformArgs(f=SentenceSplitter, pattern=lambda x: x.endswith('.txt'),
+                            kwargs=dict(chunk_size=512))
+        assert ta1.signature() == ta2.signature()
+
+    def test_transform_args_signature_with_pipeline(self):
+        ta1 = TransformArgs(f=lazyllm.pipeline(SentenceSplitter(chunk_size=128, chunk_overlap=10)),
+                            trans_node=True)
+        ta2 = TransformArgs(f=lazyllm.pipeline(SentenceSplitter(chunk_size=128, chunk_overlap=10)),
+                            trans_node=True)
+        # both are __unstable__, so signatures are equal
+        assert ta1.signature() == ta2.signature()

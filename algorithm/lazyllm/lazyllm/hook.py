@@ -1,0 +1,284 @@
+from abc import ABC, abstractmethod
+import inspect
+import ast
+import copy
+from contextlib import contextmanager
+from functools import wraps
+from typing import Any, Callable, Optional, Sequence
+
+from .common import LOG, HandledException
+
+
+class LazyLLMHook(ABC):
+    __hook_priority__ = 100
+    __hook_error_mode__ = 'warn'
+
+    @abstractmethod
+    def __init__(self, obj):
+        pass
+
+    @abstractmethod
+    def pre_hook(self, *args, **kwargs):
+        pass
+
+    @abstractmethod
+    def post_hook(self, output):
+        pass
+
+    def on_error(self, exc):
+        return None
+
+    def finalize(self):
+        raise NotImplementedError
+
+
+class HookPhaseError(RuntimeError):
+    def __init__(self, phase: str, errors: Sequence[tuple[Any, Exception]]):
+        self.phase = phase
+        self.errors = tuple(errors)
+        super().__init__(phase, self.errors)
+
+    def __str__(self):
+        names = ', '.join(type(error).__name__ for _, error in self.errors)
+        return f'Hook phase `{self.phase}` failed with {len(self.errors)} error(s): {names}'
+
+
+def _check_and_get_pre_assign_number(func):
+    func_node = ast.parse(inspect.getsource(func)).body[0]
+
+    yield_nodes = [n for n in ast.walk(func_node) if isinstance(n, ast.Yield)]
+    yield_count = len(yield_nodes)
+    if yield_count == 0: return
+    elif yield_count > 1: raise ValueError('function can have at most one yield')
+
+    left_count = 0
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(sub, ast.Yield) for sub in ast.walk(node.value)):
+                target = node.targets[0]
+                left_count = len(target.elts) if isinstance(target, ast.Tuple) else 1
+                if left_count > 1: raise ValueError('function can have at most one pre-assign')
+                break
+    return left_count
+
+
+class LazyLLMFuncHook(LazyLLMHook):
+    def __init__(self, func):
+        self._func = func
+        self._isgeneratorfunction = inspect.isgeneratorfunction(func)
+        if self._isgeneratorfunction:
+            self._left_count = _check_and_get_pre_assign_number(func)
+
+    def pre_hook(self, *args, **kwargs):
+        if self._isgeneratorfunction:
+            self._generator = self._func(*args, **kwargs)
+            next(self._generator)
+        else:
+            self._func(*args, **kwargs)
+
+    def post_hook(self, output):
+        assert self._isgeneratorfunction, 'post_hook is only supported for generator functions'
+        try:
+            self._generator.send(output) if self._left_count == 1 else next(self._generator)
+        except StopIteration: pass
+
+
+def _materialize_hook(hook_type, obj):
+    if isinstance(hook_type, LazyLLMHook):
+        return copy.deepcopy(hook_type)
+    assert isinstance(hook_type, type) and issubclass(hook_type, LazyLLMHook), (
+        f'{hook_type} is not a subclass of LazyLLMHook')
+    return hook_type(obj)
+
+
+def _hook_priority(hook_obj):
+    return getattr(hook_obj, '__hook_priority__', 100)
+
+
+def _hook_error_mode(hook_obj):
+    mode = getattr(hook_obj, '__hook_error_mode__', 'warn')
+    if mode not in ('warn', 'raise'):
+        raise ValueError(f'Invalid hook error mode: {mode}')
+    return mode
+
+
+def _raise_hook_phase_errors(phase: str, errors):
+    if not errors:
+        return
+    raise HookPhaseError(phase, errors)
+
+
+_builtin_hook_providers: list[Callable[[Any], list]] = []
+_builtin_hook_providers_state = 'pending'
+
+
+def register_builtin_hook_provider(provider: Callable[[Any], list]):
+    if provider not in _builtin_hook_providers:
+        _builtin_hook_providers.append(provider)
+    return provider
+
+
+def _ensure_builtin_hook_providers_loaded():
+    global _builtin_hook_providers_state
+    if _builtin_hook_providers_state == 'loaded':
+        return
+    try:
+        from .tracing.collect.hook import resolve_tracing_hooks  # noqa: F401
+        _builtin_hook_providers_state = 'loaded'
+    except Exception as exc:
+        _builtin_hook_providers_state = 'pending'
+        if not isinstance(exc, ImportError):
+            raise
+
+
+def resolve_builtin_hooks(obj):
+    _ensure_builtin_hook_providers_loaded()
+    hooks = []
+    for provider in _builtin_hook_providers:
+        provided_hooks = provider(obj)
+        if provided_hooks:
+            hooks.extend(provided_hooks)
+    return hooks
+
+
+def register_hooks(obj, hooks):
+    if not hooks:
+        return obj
+    if not hasattr(obj, '_hooks'):
+        raise AttributeError(f'{type(obj).__name__} has no attribute `_hooks`')
+    for hook_type in hooks:
+        if isinstance(hook_type, LazyLLMHook):
+            exists = hook_type in obj._hooks
+        else:
+            exists = any(h is hook_type for h in obj._hooks if isinstance(h, type))
+        if not exists:
+            obj._hooks.append(hook_type)
+    return obj
+
+
+def prepare_hooks(obj, hook_types, *args, **kwargs):
+    hook_objs = []
+    materialized_hooks = []
+    for hook_type in hook_types:
+        hook_obj = _materialize_hook(hook_type, obj)
+        materialized_hooks.append(hook_obj)
+
+    materialized_hooks.sort(key=_hook_priority)
+
+    for hook_obj in materialized_hooks:
+        try:
+            hook_obj.pre_hook(*args, **kwargs)
+        except Exception as e:
+            try:
+                hook_obj.finalize()
+            except Exception as finalize_exc:
+                if _hook_error_mode(hook_obj) == 'raise':
+                    raise finalize_exc
+                LOG.warning(f'Hook `{type(hook_obj).__name__}` finalize failed and will be skipped: {finalize_exc}')
+            if _hook_error_mode(hook_obj) == 'raise':
+                for active_hook in hook_objs:
+                    try:
+                        active_hook.finalize()
+                    except Exception:
+                        pass
+                raise
+            LOG.warning(f'Hook `{type(hook_obj).__name__}` pre_hook failed and will be skipped: {e}')
+            continue
+        hook_objs.append(hook_obj)
+    return hook_objs
+
+
+def run_hooks(hook_objs, phase: str, *phase_args):
+    if phase not in ('post_hook', 'on_error', 'finalize'):
+        raise ValueError(f'Invalid hook phase: {phase}')
+    strict_errors = []
+    ordered_hooks = hook_objs[::-1]
+    for hook_obj in ordered_hooks:
+        try:
+            getattr(hook_obj, phase)(*phase_args)
+        except Exception as e:
+            if _hook_error_mode(hook_obj) == 'raise':
+                strict_errors.append((hook_obj, e))
+            else:
+                LOG.warning(f'Hook `{type(hook_obj).__name__}` {phase} failed and will be skipped: {e}')
+    _raise_hook_phase_errors(phase, strict_errors)
+
+
+@contextmanager
+def hook_execution(
+    obj: Any,
+    *hook_args: Any,
+    map_exception: Optional[Callable[[Exception], Exception]] = None,
+    **hook_kwargs: Any,
+):
+    hook_objs = tuple(
+        prepare_hooks(obj, list(getattr(obj, '_hooks', []) or []), *hook_args, **hook_kwargs)
+    )
+    _ran = False
+
+    def hooked_call(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        nonlocal _ran
+        if _ran:
+            raise RuntimeError('hooked_call() must be called at most once per hook_execution block')
+        _ran = True
+        try:
+            r = fn(*args, **kwargs)
+        except HandledException as e:
+            LOG.error(f'`{type(obj).__name__}` raised {type(e).__name__}: {e}')
+            try:
+                run_hooks(hook_objs, 'on_error', e)
+            except Exception:
+                LOG.warning('Hook on_error phase failed', exc_info=True)
+            raise
+        except Exception as e:
+            err = map_exception(e) if map_exception else e
+            nm = getattr(obj, 'name', None)
+            LOG.error(
+                f'Error in `{type(obj).__name__}`' + (f' name={nm!r}' if nm else '') + f': {err}'
+            )
+            try:
+                run_hooks(hook_objs, 'on_error', err)
+            except Exception:
+                LOG.warning('Hook on_error phase failed', exc_info=True)
+            if map_exception:
+                raise err from None
+            raise
+        else:
+            run_hooks(hook_objs, 'post_hook', r)
+            return r
+
+    try:
+        yield hooked_call
+    finally:
+        try:
+            run_hooks(hook_objs, 'finalize')
+        except Exception:
+            LOG.warning('Hook finalize phase failed', exc_info=True)
+
+
+def execution_with_hooks(
+    obj: Any = None,
+    *hook_args: Any,
+    map_exception: Optional[Callable[[Exception], Exception]] = None,
+    **hook_kwargs: Any,
+):
+    def decorator(fn: Callable[..., Any]):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            hook_obj = obj if obj is not None else args[0]
+            actual_hook_args = hook_args if obj is not None else args[1:]
+            actual_hook_kwargs = hook_kwargs if obj is not None else kwargs
+            with hook_execution(
+                hook_obj,
+                *actual_hook_args,
+                map_exception=map_exception,
+                **actual_hook_kwargs,
+            ) as hooked_call:
+                return hooked_call(fn, *args, **kwargs)
+        return wrapper
+
+    if callable(obj) and not hook_args and not hook_kwargs and map_exception is None:
+        fn = obj
+        obj = None
+        return decorator(fn)
+    return decorator

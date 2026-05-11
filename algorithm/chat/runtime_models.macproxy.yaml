@@ -1,0 +1,35 @@
+# Runtime model config for Mac-hosted Docker via SSH-proxy forwarded endpoints.
+# llm uses external API directly; internal services are accessed through host.docker.internal local forwards.
+
+llm:
+  - source: openai
+    name: minimax-m27
+    url: http://106.75.235.251:9000/v1/
+    api_key: sk-maas-GDZmEQsilc4uGXXTaWnIHmET9V0eenZ8F6eWk3LaPzE
+
+llm_instruct:
+  - source: openai
+    name: lazyllm
+    url: http://host.docker.internal:18000/v1/
+    skip_auth: true
+
+reranker:
+  - source: qwen3rerank
+    type: rerank
+    name: Qwen3-Reranker-8B
+    url: http://host.docker.internal:18331/v1/rerank
+    skip_auth: true
+
+embed_main:
+  - source: bgem3embed
+    type: embed
+    name: bgem3_emb_dense_custom
+    url: http://host.docker.internal:12269/embed
+    skip_auth: true
+
+embed_sparse:
+  - source: bgem3embed
+    type: embed
+    name: bgem3_emb_sparse_custom
+    url: http://host.docker.internal:12269/sparse_embed
+    skip_auth: true
