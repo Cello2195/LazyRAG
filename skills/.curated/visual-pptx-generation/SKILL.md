@@ -310,6 +310,93 @@ A valid visual schema should look like this pattern:
 
 The example above is not a fixed template. Adapt the slide titles, bullets, cards, metrics, and process steps to the user’s actual topic.
 
+### 5.1 Required 8-slide reference (content-dense)
+
+When the user asks for an 8-page visual deck, prefer this structure:
+
+1. `cover`
+2. `toc` / `agenda`
+3. `content_bullets`
+4. `challenge_cards`
+5. `two_column`
+6. `metric_cards` or `table` / `comparison`
+7. `timeline` or `process`
+8. `summary` / `conclusion`
+
+Example skeleton (topic: `AI时代程序员职业发展`):
+
+```json
+{
+  "title": "AI时代程序员职业发展",
+  "subtitle": "能力重构、风险识别与行动路径",
+  "language": "zh",
+  "visual_theme": "auto",
+  "slides": [
+    {"type": "cover", "title": "AI时代程序员职业发展", "subtitle": "从工具冲击到职业升级"},
+    {"type": "toc", "title": "目录", "items": ["变化趋势", "核心挑战", "机会与风险", "能力升级路线", "行动建议"]},
+    {"type": "content_bullets", "title": "开发工作的重心正在迁移", "bullets": ["AI显著缩短了样板代码和原型开发时间，岗位价值重心转向需求澄清和系统设计。", "当生成速度不再是瓶颈，测试策略、边界条件校验和线上可观测能力成为核心竞争力。", "团队协作方式从“个人写码效率”转向“端到端交付稳定性”和“跨角色协同效率”。"]},
+    {"type": "challenge_cards", "title": "程序员面临的主要挑战", "cards": [{"title": "低复杂度任务压缩", "body": "简单CRUD和模板化开发更容易被自动化覆盖，需要向更高复杂度环节迁移。"}, {"title": "质量责任上移", "body": "AI生成内容可能隐藏缺陷，开发者必须加强review、测试和安全边界控制。"}, {"title": "学习周期缩短", "body": "工具和框架迭代加速，单一技术栈经验更快过期，持续学习压力上升。"}]},
+    {"type": "two_column", "title": "AI工具带来的机会与挑战", "left": {"title": "机会", "bullets": ["自动补全和代码生成提升了原型验证速度，让开发者把时间投入高价值决策。", "AI辅助阅读陌生代码库，减少新成员理解系统结构和调用链的时间成本。", "测试生成和日志分析工具提升排障效率，缩短从发现问题到修复的闭环。"]}, "right": {"title": "挑战", "bullets": ["过度依赖模型输出会削弱独立判断能力，在复杂场景下更容易误判。", "低门槛工具扩大竞争面，基础编码能力的稀缺性下降。", "生成代码可能存在合规和可维护性风险，需要更严格的工程治理机制。"]}},
+    {"type": "metric_cards", "title": "能力价值重估", "metrics": [{"label": "重复编码价值", "value": "Down", "description": "模板化实现的人工优势持续下降。"}, {"label": "系统设计价值", "value": "Up", "description": "复杂系统的架构取舍与可靠性设计更依赖人类经验。"}, {"label": "AI协作能力", "value": "Up", "description": "会拆解任务、会验证结果的工程师获得更高生产力杠杆。"}]},
+    {"type": "timeline", "title": "能力升级路线图", "items": [{"time": "0-3月", "title": "夯实基础与AI工具链", "desc": "建立提示词、代码审查、测试生成的日常协作流程。"}, {"time": "3-6月", "title": "强化系统设计能力", "desc": "重点训练边界建模、性能优化与稳定性设计。"}, {"time": "6-12月", "title": "沉淀业务闭环能力", "desc": "围绕真实业务场景完成从需求到上线的端到端交付。"}, {"time": "12月+", "title": "形成复合竞争力", "desc": "把工程能力、业务理解和AI协作方法论固化为可复用资产。"}]},
+    {"type": "summary", "title": "总结与行动建议", "bullets": ["不要把竞争焦点放在基础编码速度，而要提升问题定义和系统治理能力。", "把AI当作放大器而不是替代者，持续保留对结果的验证与责任意识。", "通过真实项目沉淀可复用的方法论，建立长期稳定的职业护城河。"]}
+  ]
+}
+```
+
+### 5.2 Forbidden anti-patterns (validator will reject)
+
+The following schema fragments are invalid and should not be sent to generation tools:
+
+```json
+{"type": "content_bullets", "title": "核心趋势"}
+```
+
+```json
+{"type": "two_column", "title": "机会与挑战"}
+```
+
+```json
+{
+  "type": "two_column",
+  "title": "机会与挑战",
+  "left": {"title": "Left"},
+  "right": {"title": "Right"}
+}
+```
+
+```json
+{
+  "type": "challenge_cards",
+  "title": "主要挑战",
+  "cards": [{"title": "技能焦虑"}, {"title": "工具变化"}]
+}
+```
+
+Typical rejection codes:
+- `schema_validation_failed`
+- `sparse_body_slide`
+- `too_few_substantive_slides`
+- `placeholder_content`
+
+### 5.3 Retry strategy on density failures
+
+If tool output contains any of:
+- `schema_validation_failed`
+- `sparse_body_slide`
+- `too_few_substantive_slides`
+- `placeholder_content`
+- `html_qa_failed`
+- `sparse_rendered_slide`
+
+Then the agent must:
+
+1. Do not directly return failure to the user.
+2. Rebuild `deck_schema` using issue details.
+3. Increase body density on weak slides (bullets/cards/metrics/table/timeline content).
+4. Call generation tool again.
+5. Retry at most 1-2 times to avoid infinite loops.
+
 ## 6. Slide type policy
 
 Choose slide types according to content:

@@ -73,6 +73,22 @@ def _parse_schema_or_failure(deck_schema: Any) -> tuple[Optional[Dict[str, Any]]
         }
 
 
+def _schema_failure_hints() -> list[str]:
+    return [
+        'Rebuild deck_schema with substantive body content.',
+        'Do not generate title-only or outline-only body slides.',
+        'Fill two_column/cards/metrics/table/process slides with concrete details before retrying.',
+    ]
+
+
+def _qa_failure_hints() -> list[str]:
+    return [
+        'Rebuild deck_schema with richer bullets, cards, tables, or timeline/process steps.',
+        'Remove placeholder labels such as Left/Right/Point 1/TODO/TBD.',
+        'Ensure each non-cover/non-TOC/non-section slide has substantive explanatory text.',
+    ]
+
+
 @fc_register('tool', execute_in_sandbox=False)
 @_handle_tool_errors
 def html_deck_validate_schema(deck_schema: Any, theme: Optional[Any] = None) -> Dict[str, Any]:
@@ -237,10 +253,20 @@ def html_deck_generate_visual_pptx(
     output_dir: Optional[str] = None,
     require_screenshots: bool = False,
 ) -> Dict[str, Any]:
-    """Generate a theme-aware visual deck and optional image-based PPTX.
+    """Generate a theme-aware visual HTML deck and optional image-based PPTX.
 
     Workflow:
       deck_schema -> HTML slides -> HTML QA -> Playwright screenshots -> PPTX images -> artifact_save
+
+    Content-density contract:
+      - Do not pass outline-only or title-only deck_schema.
+      - Every non-cover, non-TOC, non-section slide must include substantive body content.
+      - content_bullets/summary slides need at least 3 concrete bullets with explanatory text.
+      - cards/challenge slides need at least 3 cards, each with title and body.
+      - two_column slides need both columns filled with real titles and bullets; placeholder labels such as Left/Right are invalid.
+      - metric/table/process/timeline slides must include real descriptions/rows/steps, not headers-only shells.
+      - If validation fails with sparse_body_slide, too_few_substantive_slides, placeholder_content, or html_qa_failed,
+        rebuild deck_schema with richer content and call the tool again.
 
     If Playwright is unavailable, this still returns a persisted HTML deck and
     the screenshot/PPTX step reports a graceful warning.
@@ -263,6 +289,8 @@ def html_deck_generate_visual_pptx(
             'success': False,
             'error_code': 'schema_validation_failed',
             'reason': 'deck_schema validation failed',
+            'issues': validation_result.get('issues') or [],
+            'hints': _schema_failure_hints(),
             'validation': validation_result,
         }
 
@@ -271,6 +299,8 @@ def html_deck_generate_visual_pptx(
             'success': False,
             'error_code': 'schema_validation_failed',
             'reason': 'deck_schema has validation issues',
+            'issues': validation_result.get('issues') or [],
+            'hints': _schema_failure_hints(),
             'validation': validation_result,
         }
 
@@ -290,6 +320,22 @@ def html_deck_generate_visual_pptx(
         index_path=html_result.get('index_path'),
         persist_index_artifact=False,
     )
+    qa_result = run_html_deck_qa(
+        deck_dir=html_result.get('deck_dir'),
+        slide_paths=html_result.get('slide_paths') or [],
+        screenshot_result=None,
+    )
+    if qa_result.get('issues'):
+        return {
+            'success': False,
+            'error_code': 'html_qa_failed',
+            'reason': 'Generated HTML deck failed content-density QA.',
+            'html_deck': html_result,
+            'preview': preview_result,
+            'html_qa': qa_result,
+            'hints': _qa_failure_hints(),
+        }
+
     screenshot_result: Dict[str, Any] = {}
     pptx_result: Dict[str, Any] = {}
     saved_pptx: Dict[str, Any] = {}
@@ -333,6 +379,18 @@ def html_deck_generate_visual_pptx(
         slide_paths=html_result.get('slide_paths') or [],
         screenshot_result=screenshot_result if screenshot_result else None,
     )
+    if qa_result.get('issues'):
+        return {
+            'success': False,
+            'error_code': 'html_qa_failed',
+            'reason': 'Generated HTML deck failed content-density QA.',
+            'html_deck': html_result,
+            'preview': preview_result,
+            'html_qa': qa_result,
+            'screenshot_result': screenshot_result,
+            'pptx_result': pptx_result,
+            'hints': _qa_failure_hints(),
+        }
 
     try:
         bundle_result = save_html_deck_bundle(

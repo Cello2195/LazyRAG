@@ -6,14 +6,38 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 _PLACEHOLDER_RE = re.compile(r'(lorem ipsum|placeholder|todo|tbd|xxxx|待补充)', re.IGNORECASE)
+_PLACEHOLDER_LABEL_RE = re.compile(
+    r'(?<!\w)(column\s*1|column\s*2|point\s*1|point\s*2|todo|tbd|lorem ipsum)(?!\w)|占位|待补充|待完善',
+    re.IGNORECASE,
+)
+_PLACEHOLDER_HEADING_RE = re.compile(
+    r'<h[1-6][^>]*>\s*(left|right|column\s*1|column\s*2|point\s*1|point\s*2)\s*</h[1-6]>',
+    re.IGNORECASE,
+)
 _IMG_RE = re.compile(r'<img\s+[^>]*src=["\']([^"\']+)["\']', re.IGNORECASE)
 _TITLE_TAG_RE = re.compile(r'<h[1-3][^>]*>(.*?)</h[1-3]>', re.IGNORECASE | re.DOTALL)
 _TEXT_RE = re.compile(r'<[^>]+>')
 _HEX_RE = re.compile(r'#[0-9a-fA-F]{3,8}')
+_LAYOUT_ATTR_RE = re.compile(r'data-layout=["\']([^"\']+)["\']', re.IGNORECASE)
+_LI_RE = re.compile(r'<li\b[^>]*>(.*?)</li>', re.IGNORECASE | re.DOTALL)
+_TR_RE = re.compile(r'<tr\b[^>]*>', re.IGNORECASE)
+_ARTICLE_RE = re.compile(r'<article\b[^>]*>', re.IGNORECASE)
 _CDN_RE = re.compile(
     r'''<(?:script|link)[^>]+(?:src|href)=["']https?://[^"']+["']''',
     re.IGNORECASE,
 )
+_RELAXED_LAYOUTS = {'cover_hero', 'toc_numbered', 'section_divider', 'references'}
+_STRUCTURAL_LAYOUTS = {
+    'content_bullets',
+    'summary',
+    'metric_cards',
+    'challenge_cards',
+    'two_column',
+    'comparison',
+    'table',
+    'process',
+    'timeline',
+}
 
 
 def _entry(level: str, code: str, message: str, slide: int | None = None) -> Dict[str, Any]:
@@ -74,6 +98,23 @@ def _collect_layout_name(content: str) -> str:
     if m:
         return _extract_text(m.group(1)).strip()
     return ''
+
+
+def _extract_layout_id(content: str) -> str:
+    match = _LAYOUT_ATTR_RE.search(content)
+    if not match:
+        return ''
+    return str(match.group(1) or '').strip().lower()
+
+
+def _extract_body_text(text: str, title: str) -> str:
+    full = str(text or '').strip()
+    if not full:
+        return ''
+    title_clean = str(title or '').strip()
+    if title_clean:
+        full = full.replace(title_clean, '', 1).strip()
+    return full
 
 
 def _is_mostly_monochrome(slide_contents: List[str]) -> bool:
@@ -251,21 +292,33 @@ def run_html_deck_qa(
         size_bytes = path.stat().st_size
         text = _extract_text(content)
         title = _extract_title(content)
+        body_text = _extract_body_text(text, title)
         image_refs = _IMG_RE.findall(content)
         missing_images = _missing_image_paths(path, content)
         has_external_cdn = bool(_CDN_RE.search(content))
         layout = _collect_layout_name(content)
+        layout_id = _extract_layout_id(content) or layout
+        list_item_count = len(_LI_RE.findall(content))
+        table_row_count = max(0, len(_TR_RE.findall(content)) - 1)
+        article_count = len(_ARTICLE_RE.findall(content))
         if layout:
             layout_names.add(layout)
+        if layout_id:
+            layout_names.add(layout_id)
 
         slide_detail.update(
             {
                 'size_bytes': size_bytes,
                 'html_length': len(content),
                 'text_len': len(text),
+                'body_text_len': len(body_text),
                 'title': title,
                 'image_ref_count': len(image_refs),
                 'layout': layout,
+                'layout_id': layout_id,
+                'list_item_count': list_item_count,
+                'table_row_count': table_row_count,
+                'article_count': article_count,
             }
         )
 
@@ -279,6 +332,10 @@ def run_html_deck_qa(
             slide_detail['issues'].append(issue)
         if _PLACEHOLDER_RE.search(content):
             issue = _entry('error', 'placeholder_residue', 'slide contains placeholder-like text', idx)
+            issues.append(issue)
+            slide_detail['issues'].append(issue)
+        if _PLACEHOLDER_HEADING_RE.search(content) or _PLACEHOLDER_LABEL_RE.search(body_text):
+            issue = _entry('error', 'placeholder_label', 'slide contains placeholder labels such as Left/Right/Point 1', idx)
             issues.append(issue)
             slide_detail['issues'].append(issue)
         if missing_images:
@@ -307,6 +364,45 @@ def run_html_deck_qa(
             issue = _entry('error', 'blank_slide', 'slide appears blank', idx)
             issues.append(issue)
             slide_detail['issues'].append(issue)
+
+        relaxed_layout = layout_id in _RELAXED_LAYOUTS
+        if not relaxed_layout:
+            if len(body_text) < 80:
+                issue = _entry('error', 'sparse_rendered_slide', 'Rendered slide contains too little body text.', idx)
+                issues.append(issue)
+                slide_detail['issues'].append(issue)
+
+            if layout_id == 'metric_cards':
+                has_substantive_structure = bool(
+                    article_count >= 2
+                    or list_item_count >= 2
+                    or len(body_text) >= 80
+                )
+            else:
+                has_substantive_structure = bool(
+                    list_item_count >= 3
+                    or table_row_count >= 3
+                    or article_count >= 3
+                )
+            if not has_substantive_structure:
+                issue = _entry(
+                    'error',
+                    'too_few_list_items',
+                    'Rendered body slide has too few list/table/card items to be substantive.',
+                    idx,
+                )
+                issues.append(issue)
+                slide_detail['issues'].append(issue)
+
+            if layout_id in _STRUCTURAL_LAYOUTS and not has_substantive_structure:
+                issue = _entry(
+                    'error',
+                    'empty_structural_slide',
+                    'Slide uses structural layout but content is mostly empty.',
+                    idx,
+                )
+                issues.append(issue)
+                slide_detail['issues'].append(issue)
         if len(text) > 1400:
             warning = _entry('warning', 'text_too_long', f'slide text is too long ({len(text)} chars)', idx)
             warnings.append(warning)

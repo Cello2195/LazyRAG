@@ -245,7 +245,7 @@ def _layout_metric_cards(slide: Mapping[str, Any], deck: Mapping[str, Any], page
     metrics = slide.get('metrics') if isinstance(slide.get('metrics'), list) else []
     metrics = [m for m in metrics if isinstance(m, Mapping)][:4]
     if not metrics:
-        metrics = [{'label': 'Metric', 'value': '--', 'description': 'N/A'}]
+        metrics = [{'label': '', 'value': '', 'description': '[Missing metric content]'}]
     hero = metrics[0]
     small_cards = ''.join(
         f'<article><small>{_h(_trim(item.get("label"), 22))}</small><strong>{_h(_trim(item.get("value"), 18))}</strong><p>{_h(_trim(item.get("description"), 58))}</p></article>'
@@ -268,7 +268,7 @@ def _layout_metric_cards(slide: Mapping[str, Any], deck: Mapping[str, Any], page
 def _layout_challenge_cards(slide: Mapping[str, Any], deck: Mapping[str, Any], page: int, total: int) -> str:
     cards = slide.get('cards') if isinstance(slide.get('cards'), list) and slide.get('cards') else []
     if not cards:
-        cards = [{'title': f'Point {i+1}', 'body': txt, 'accent': 'primary'} for i, txt in enumerate(_as_list(slide.get('bullets'))[:6])]
+        cards = [{'title': '', 'body': txt, 'accent': 'primary'} for txt in _as_list(slide.get('bullets'))[:6]]
     grid = []
     for idx, item in enumerate(cards[:6], start=1):
         color = _accent_for(item.get('accent'), deck['visual_theme']) if isinstance(item, Mapping) else deck['visual_theme']['accent']
@@ -304,11 +304,11 @@ def _layout_two_column(slide: Mapping[str, Any], deck: Mapping[str, Any], page: 
     if not left or not right:
         columns = slide.get('columns') if isinstance(slide.get('columns'), list) else []
         if len(columns) >= 2:
-            left = columns[0] if isinstance(columns[0], Mapping) else {'title': 'Left', 'bullets': _as_list(columns[0])}
-            right = columns[1] if isinstance(columns[1], Mapping) else {'title': 'Right', 'bullets': _as_list(columns[1])}
+            left = columns[0] if isinstance(columns[0], Mapping) else {'title': '', 'bullets': _as_list(columns[0])}
+            right = columns[1] if isinstance(columns[1], Mapping) else {'title': '', 'bullets': _as_list(columns[1])}
     def _col(item: Mapping[str, Any], idx: int) -> str:
         bullets = ''.join(f'<li>{_h(_trim(x, 56))}</li>' for x in _as_list(item.get('bullets') or item.get('items'))[:5])
-        return f'<article><span>{idx:02d}</span><h4>{_h(_trim(item.get("title") or ("Left" if idx == 1 else "Right"), 28))}</h4><ul>{bullets}</ul></article>'
+        return f'<article><span>{idx:02d}</span><h4>{_h(_trim(item.get("title") or "", 28))}</h4><ul>{bullets}</ul></article>'
     return f'''
     {_background_art(deck['visual_theme'], page=page)}
     <header class="slide-header"><small>{_h(_kicker(slide, page))}</small><h2>{_h(_trim(slide.get('title'), 54))}</h2></header>
@@ -334,7 +334,7 @@ def _layout_comparison(slide: Mapping[str, Any], deck: Mapping[str, Any], page: 
     else:
         left_items = ''.join(f'<li>{_h(_trim(x, 54))}</li>' for x in _as_list(slide.get('left_items'))[:5])
         right_items = ''.join(f'<li>{_h(_trim(x, 54))}</li>' for x in _as_list(slide.get('right_items'))[:5])
-        matrix = f'<div class="compare-panels"><article><h4>{_h(_trim(slide.get("left_title") or "A", 24))}</h4><ul>{left_items}</ul></article><span>VS</span><article><h4>{_h(_trim(slide.get("right_title") or "B", 24))}</h4><ul>{right_items}</ul></article></div>'
+        matrix = f'<div class="compare-panels"><article><h4>{_h(_trim(slide.get("left_title") or "", 24))}</h4><ul>{left_items}</ul></article><span>VS</span><article><h4>{_h(_trim(slide.get("right_title") or "", 24))}</h4><ul>{right_items}</ul></article></div>'
     return f'''
     {_background_art(deck['visual_theme'], page=page)}
     <header class="slide-header"><small>{_h(_kicker(slide, page))}</small><h2>{_h(_trim(slide.get('title'), 54))}</h2></header>
@@ -355,8 +355,6 @@ def _layout_table(slide: Mapping[str, Any], deck: Mapping[str, Any], page: int, 
         while len(cells) < len(headers):
             cells.append('')
         body_rows.append('<tr>' + ''.join(f'<td>{_h(_trim(c, 36))}</td>' for c in cells) + '</tr>')
-    if not body_rows:
-        body_rows.append('<tr>' + ''.join('<td>—</td>' for _ in headers[:3]) + '</tr>')
     return f'''
     {_background_art(deck['visual_theme'], page=page)}
     <header class="slide-header"><small>{_h(_kicker(slide, page))}</small><h2>{_h(_trim(slide.get('title'), 54))}</h2></header>
@@ -367,7 +365,7 @@ def _layout_table(slide: Mapping[str, Any], deck: Mapping[str, Any], page: int, 
 
 
 def _layout_summary(slide: Mapping[str, Any], deck: Mapping[str, Any], page: int, total: int) -> str:
-    bullets = _as_list(slide.get('bullets') or slide.get('items'))[:5] or ['形成统一结论', '明确下一步行动', '持续迭代与复盘']
+    bullets = _as_list(slide.get('bullets') or slide.get('items'))[:5]
     cards = ''.join(f'<article><b>{idx:02d}</b><p>{_h(_trim(item, 84))}</p></article>' for idx, item in enumerate(bullets, start=1))
     return f'''
     {_background_art(deck['visual_theme'], page=page)}
@@ -390,8 +388,6 @@ def _layout_quote(slide: Mapping[str, Any], deck: Mapping[str, Any], page: int, 
 
 def _layout_process(slide: Mapping[str, Any], deck: Mapping[str, Any], page: int, total: int) -> str:
     items = _as_list(slide.get('steps') or slide.get('bullets') or slide.get('items'))[:5]
-    if not items:
-        items = ['理解问题', '规划方案', '执行验证', '复盘迭代']
     steps = ''.join(f'<article><b>{idx:02d}</b><p>{_h(_trim(item, 58))}</p></article>' for idx, item in enumerate(items, start=1))
     return f'''
     {_background_art(deck['visual_theme'], page=page)}

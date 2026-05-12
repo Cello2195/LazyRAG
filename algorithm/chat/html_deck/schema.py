@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Mapping
@@ -49,6 +50,8 @@ except Exception:  # pragma: no cover
 SLIDE_TYPES = {
     'cover',
     'toc',
+    'agenda',
+    'section',
     'section_divider',
     'metric_cards',
     'challenge_cards',
@@ -57,6 +60,9 @@ SLIDE_TYPES = {
     'comparison',
     'table',
     'summary',
+    'conclusion',
+    'closing',
+    'thank_you',
     'quote',
     'process',
     'timeline',
@@ -113,6 +119,7 @@ _TYPE_ALIASES = {
     'title': 'cover',
     'cover': 'cover',
     'toc': 'toc',
+    'agenda': 'agenda',
     'contents': 'toc',
     'section': 'section_divider',
     'divider': 'section_divider',
@@ -128,6 +135,10 @@ _TYPE_ALIASES = {
     'compare': 'comparison',
     'table': 'table',
     'summary': 'summary',
+    'conclusion': 'conclusion',
+    'closing': 'closing',
+    'thank_you': 'thank_you',
+    'thanks': 'thank_you',
     'quote': 'quote',
     'process': 'process',
     'timeline': 'timeline',
@@ -240,6 +251,286 @@ def _normalize_palette(palette: Any) -> Dict[str, Any]:
     return {}
 
 
+_SOFT_SLIDE_TYPES = {
+    'cover',
+    'toc',
+    'agenda',
+    'section',
+    'section_divider',
+    'references',
+    'thank_you',
+    'closing',
+}
+_SECTION_SLIDE_TYPES = {'section', 'section_divider'}
+_PLACEHOLDER_EXACT_RE = re.compile(
+    r'^(left|right|column\s*1|column\s*2|point\s*1|point\s*2|todo|tbd|lorem ipsum|占位|待补充|待完善|示例内容)$',
+    re.IGNORECASE,
+)
+_PLACEHOLDER_TEXT_RE = re.compile(
+    r'(?<!\w)(column\s*1|column\s*2|point\s*1|point\s*2|todo|tbd|lorem ipsum)(?!\w)|占位|待补充|待完善|示例内容',
+    re.IGNORECASE,
+)
+_CJK_RE = re.compile(r'[\u4e00-\u9fff]')
+_WORD_RE = re.compile(r'[A-Za-z0-9]+')
+
+
+def _slide_type(slide: Mapping[str, Any]) -> str:
+    raw = str(slide.get('type') or '').strip().lower().replace('-', '_').replace(' ', '_')
+    return _TYPE_ALIASES.get(raw, raw)
+
+
+def _non_space_len(value: Any) -> int:
+    return len(re.sub(r'\s+', '', str(value or '').strip()))
+
+
+def _content_units(value: Any) -> int:
+    text = str(value or '').strip()
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    words = len(_WORD_RE.findall(text))
+    compact = _non_space_len(text)
+    return max(cjk + words * 2, compact)
+
+
+def _looks_substantive_text(value: Any, *, min_units: int = 12) -> bool:
+    text = str(value or '').strip()
+    if not text:
+        return False
+    if _PLACEHOLDER_EXACT_RE.match(text):
+        return False
+    return _content_units(text) >= min_units
+
+
+def _contains_placeholder(value: Any) -> bool:
+    text = str(value or '').strip()
+    if not text:
+        return False
+    return bool(_PLACEHOLDER_TEXT_RE.search(text))
+
+
+def _to_rows(raw_rows: Any) -> List[List[str]]:
+    if not isinstance(raw_rows, list):
+        return []
+    rows: List[List[str]] = []
+    for row in raw_rows:
+        if isinstance(row, list):
+            rows.append([str(cell or '').strip() for cell in row])
+        else:
+            rows.append([str(row or '').strip()])
+    return rows
+
+
+def _resolve_two_columns(slide: Mapping[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    left = dict(slide.get('left')) if isinstance(slide.get('left'), Mapping) else {}
+    right = dict(slide.get('right')) if isinstance(slide.get('right'), Mapping) else {}
+    if left and right:
+        return left, right
+    columns = slide.get('columns') if isinstance(slide.get('columns'), list) else []
+    if len(columns) >= 2:
+        if isinstance(columns[0], Mapping):
+            left = dict(columns[0])
+        else:
+            left = {'title': '', 'bullets': _as_list(columns[0])}
+        if isinstance(columns[1], Mapping):
+            right = dict(columns[1])
+        else:
+            right = {'title': '', 'bullets': _as_list(columns[1])}
+    return left, right
+
+
+def _required_substantive_slides(total_slides: int) -> int:
+    if total_slides <= 0:
+        return 0
+    if total_slides <= 4:
+        return max(1, total_slides - 1)
+    if total_slides <= 7:
+        return max(3, math.ceil(total_slides * 0.6))
+    return max(4, math.ceil(total_slides * 0.6))
+
+
+def _max_section_slides(total_slides: int) -> int:
+    if total_slides <= 6:
+        return 1
+    if total_slides <= 10:
+        return 2
+    return max(2, math.ceil(total_slides * 0.25))
+
+
+def _is_substantive_body_slide(slide: Mapping[str, Any]) -> tuple[bool, List[str]]:
+    slide_type = _slide_type(slide)
+    reasons: List[str] = []
+
+    def _check_bullet_block(raw: Any, *, label: str = 'bullets') -> None:
+        bullets = _as_list(raw)
+        if len(bullets) < 3:
+            reasons.append(f'{label} count < 3')
+            return
+        short_count = 0
+        total_units = 0
+        for idx, bullet in enumerate(bullets, start=1):
+            if _contains_placeholder(bullet):
+                reasons.append(f'{label}[{idx}] contains placeholder content')
+            units = _content_units(bullet)
+            total_units += units
+            if units < 12:
+                short_count += 1
+        if short_count:
+            reasons.append(f'{label} has {short_count} short items')
+        if total_units < 80:
+            reasons.append(f'{label} total body text too short ({total_units} < 80)')
+
+    if slide_type in {'content_bullets', 'summary', 'conclusion'}:
+        _check_bullet_block(slide.get('bullets') or slide.get('items') or slide.get('takeaways'))
+
+    elif slide_type == 'challenge_cards':
+        cards = slide.get('cards') if isinstance(slide.get('cards'), list) else []
+        if len(cards) < 3:
+            reasons.append('cards count < 3')
+        total_units = 0
+        for idx, card in enumerate(cards, start=1):
+            if not isinstance(card, Mapping):
+                reasons.append(f'card[{idx}] is not an object')
+                continue
+            title = str(card.get('title') or '').strip()
+            body = str(card.get('body') or '').strip()
+            if not title:
+                reasons.append(f'card[{idx}] missing title')
+            if _contains_placeholder(title):
+                reasons.append(f'card[{idx}] title contains placeholder content')
+            if not body:
+                reasons.append(f'card[{idx}] missing body')
+                continue
+            if _contains_placeholder(body):
+                reasons.append(f'card[{idx}] body contains placeholder content')
+            units = _content_units(body)
+            total_units += units
+            if units < 12:
+                reasons.append(f'card[{idx}] body too short')
+        if cards and total_units < 60:
+            reasons.append(f'cards total body text too short ({total_units} < 60)')
+
+    elif slide_type == 'metric_cards':
+        metrics = slide.get('metrics') if isinstance(slide.get('metrics'), list) else []
+        if len(metrics) < 2:
+            reasons.append('metrics count < 2')
+        for idx, metric in enumerate(metrics, start=1):
+            if not isinstance(metric, Mapping):
+                reasons.append(f'metric[{idx}] is not an object')
+                continue
+            label = str(metric.get('label') or '').strip()
+            value = str(metric.get('value') or '').strip()
+            description = str(metric.get('description') or '').strip()
+            if not label:
+                reasons.append(f'metric[{idx}] missing label')
+            if not value:
+                reasons.append(f'metric[{idx}] missing value')
+            if not description:
+                reasons.append(f'metric[{idx}] missing description')
+            elif not _looks_substantive_text(description, min_units=10):
+                reasons.append(f'metric[{idx}] description too short')
+            if _contains_placeholder(f'{label} {value} {description}'):
+                reasons.append(f'metric[{idx}] contains placeholder content')
+
+    elif slide_type == 'two_column':
+        left, right = _resolve_two_columns(slide)
+        if not left or not right:
+            reasons.append('missing left/right column objects')
+        total_units = 0
+        for name, col in (('left', left), ('right', right)):
+            title = str(col.get('title') or '').strip()
+            if not title:
+                reasons.append(f'{name}.title is empty')
+            elif _PLACEHOLDER_EXACT_RE.match(title):
+                reasons.append(f'{name}.title is placeholder content')
+            bullets = _as_list(col.get('bullets') or col.get('items'))
+            if len(bullets) < 3:
+                reasons.append(f'{name}.bullets count < 3')
+                continue
+            for idx, bullet in enumerate(bullets, start=1):
+                if _contains_placeholder(bullet):
+                    reasons.append(f'{name}.bullets[{idx}] contains placeholder content')
+                units = _content_units(bullet)
+                total_units += units
+                if units < 10:
+                    reasons.append(f'{name}.bullets[{idx}] too short')
+        if total_units < 100:
+            reasons.append(f'two_column total body text too short ({total_units} < 100)')
+
+    elif slide_type in {'comparison', 'table'}:
+        headers = _as_list(slide.get('headers'))
+        rows = _to_rows(slide.get('rows'))
+        if headers and rows:
+            if len(headers) < 2:
+                reasons.append('table headers count < 2')
+            if len(rows) < 3:
+                reasons.append('table rows count < 3')
+            for idx, row in enumerate(rows, start=1):
+                if not any(str(cell or '').strip() for cell in row):
+                    reasons.append(f'row[{idx}] is empty')
+        else:
+            left_items = _as_list(slide.get('left_items'))
+            right_items = _as_list(slide.get('right_items'))
+            if len(left_items) < 3 or len(right_items) < 3:
+                reasons.append('comparison items are insufficient (<3 per side)')
+            if _PLACEHOLDER_EXACT_RE.match(str(slide.get('left_title') or '').strip()):
+                reasons.append('left_title is placeholder content')
+            if _PLACEHOLDER_EXACT_RE.match(str(slide.get('right_title') or '').strip()):
+                reasons.append('right_title is placeholder content')
+
+    elif slide_type in {'process', 'timeline'}:
+        raw_steps = slide.get('steps') if isinstance(slide.get('steps'), list) else []
+        raw_items = slide.get('items') if isinstance(slide.get('items'), list) else []
+        steps = raw_steps or raw_items
+        if len(steps) < 4:
+            reasons.append('steps/items count < 4')
+        for idx, item in enumerate(steps, start=1):
+            if isinstance(item, Mapping):
+                title = str(item.get('title') or '').strip()
+                description = str(item.get('description') or item.get('desc') or '').strip()
+                if slide_type == 'timeline' and not str(item.get('time') or '').strip():
+                    reasons.append(f'{slide_type}[{idx}] missing time')
+                if not title:
+                    reasons.append(f'{slide_type}[{idx}] missing title')
+                if not description:
+                    reasons.append(f'{slide_type}[{idx}] missing description')
+                elif not _looks_substantive_text(description, min_units=10):
+                    reasons.append(f'{slide_type}[{idx}] description too short')
+                if _contains_placeholder(f'{title} {description}'):
+                    reasons.append(f'{slide_type}[{idx}] contains placeholder content')
+            else:
+                if not _looks_substantive_text(item, min_units=12):
+                    reasons.append(f'{slide_type}[{idx}] text too short')
+
+    elif slide_type == 'quote':
+        quote = (
+            slide.get('quote')
+            or slide.get('body')
+            or slide.get('subtitle')
+            or slide.get('title')
+            or ''
+        )
+        if not _looks_substantive_text(quote, min_units=24):
+            reasons.append('quote text too short')
+        author = str(slide.get('author') or slide.get('source') or '').strip()
+        if not author:
+            reasons.append('quote source/author is empty')
+        elif _contains_placeholder(author):
+            reasons.append('quote source/author contains placeholder content')
+
+    else:
+        has_body = bool(
+            _as_list(slide.get('bullets') or slide.get('items') or slide.get('steps'))
+            or (slide.get('cards') if isinstance(slide.get('cards'), list) else [])
+            or (slide.get('metrics') if isinstance(slide.get('metrics'), list) else [])
+            or (_to_rows(slide.get('rows')))
+        )
+        if not has_body:
+            reasons.append('missing body structures (bullets/cards/metrics/rows/steps)')
+
+    return len(reasons) == 0, reasons
+
+
 def _infer_slide_type(slide: Mapping[str, Any], index: int) -> str:
     raw_type = str(slide.get('type') or slide.get('slide_type') or '').strip().lower().replace('-', '_').replace(' ', '_')
     if raw_type:
@@ -278,6 +569,8 @@ def resolve_slide_layout(slide: Mapping[str, Any], deck_schema: Mapping[str, Any
     mapping = {
         'cover': 'cover_hero',
         'toc': 'toc_numbered',
+        'agenda': 'toc_numbered',
+        'section': 'section_divider',
         'section_divider': 'section_divider',
         'metric_cards': 'metric_cards',
         'challenge_cards': 'challenge_cards',
@@ -286,6 +579,9 @@ def resolve_slide_layout(slide: Mapping[str, Any], deck_schema: Mapping[str, Any
         'comparison': 'comparison',
         'table': 'table',
         'summary': 'summary',
+        'conclusion': 'summary',
+        'closing': 'summary',
+        'thank_you': 'summary',
         'quote': 'quote',
         'process': 'process',
         'timeline': 'timeline',
@@ -483,12 +779,9 @@ def validate_visual_deck_schema(deck_schema: Any, theme: Any = None) -> Dict[str
         }
 
     base = validate_deck_schema(parsed_input)
-    normalized = normalize_visual_deck_schema(
-        base.get('normalized_schema') if isinstance(base, dict) else parsed_input,
-        theme=theme,
-    )
+    normalized = normalize_visual_deck_schema(parsed_input, theme=theme)
 
-    issues: List[Dict[str, Any]] = []
+    issues: List[Dict[str, Any]] = list(base.get('issues') or []) if isinstance(base, dict) else []
     warnings: List[Dict[str, Any]] = list(base.get('warnings') or []) if isinstance(base, dict) else []
 
     if not normalized.get('title'):
@@ -497,7 +790,13 @@ def validate_visual_deck_schema(deck_schema: Any, theme: Any = None) -> Dict[str
         issues.append({'level': 'error', 'code': 'missing_slides', 'message': 'no slides after normalization'})
 
     seen_layouts: set[str] = set()
-    for idx, slide in enumerate(normalized.get('slides') or [], start=1):
+    cover_count = 0
+    toc_count = 0
+    section_count = 0
+    substantive_count = 0
+    slides = normalized.get('slides') or []
+    total_slides = len(slides)
+    for idx, slide in enumerate(slides, start=1):
         if not slide.get('title'):
             warnings.append({'level': 'warning', 'code': 'slide_missing_title', 'message': f'slide {idx} missing title'})
         layout = str(slide.get('layout') or '')
@@ -505,6 +804,86 @@ def validate_visual_deck_schema(deck_schema: Any, theme: Any = None) -> Dict[str
             seen_layouts.add(layout)
         for warn in slide.get('_warnings') or []:
             warnings.append({'level': 'warning', 'code': warn, 'message': f'slide {idx}: {warn}'})
+
+        slide_type = _slide_type(slide)
+        if slide_type == 'cover':
+            cover_count += 1
+        if slide_type in {'toc', 'agenda'}:
+            toc_count += 1
+        if slide_type in _SECTION_SLIDE_TYPES:
+            section_count += 1
+
+        if slide_type in _SOFT_SLIDE_TYPES:
+            continue
+
+        substantive_ok, reasons = _is_substantive_body_slide(slide)
+        if substantive_ok:
+            substantive_count += 1
+            continue
+
+        has_placeholder = any('placeholder' in reason.lower() for reason in reasons)
+        issues.append(
+            {
+                'level': 'error',
+                'code': 'placeholder_content' if has_placeholder else 'sparse_body_slide',
+                'slide_index': idx,
+                'slide_title': str(slide.get('title') or ''),
+                'message': 'Slide has title but insufficient substantive body content. Rebuild deck_schema with richer details before rendering.',
+                'reasons': reasons[:8],
+                'hints': [
+                    'Add at least 3 concrete bullets with explanatory text.',
+                    'Do not use title-only or outline-only body slides.',
+                    'For two_column slides, fill both left and right columns with substantive bullets.',
+                ],
+            }
+        )
+
+    if cover_count > 1:
+        issues.append(
+            {
+                'level': 'error',
+                'code': 'too_many_cover_slides',
+                'message': f'cover slides exceed limit (count={cover_count}, max=1)',
+                'hints': ['Keep only one cover slide and convert extra cover pages to substantive body slides.'],
+            }
+        )
+    if toc_count > 1:
+        issues.append(
+            {
+                'level': 'error',
+                'code': 'too_many_toc_slides',
+                'message': f'toc/agenda slides exceed limit (count={toc_count}, max=1)',
+                'hints': ['Keep only one toc/agenda slide; move details into body slides.'],
+            }
+        )
+
+    section_limit = _max_section_slides(total_slides)
+    if section_count > section_limit:
+        issues.append(
+            {
+                'level': 'error',
+                'code': 'too_many_section_slides',
+                'message': f'section divider slides are too many (count={section_count}, max={section_limit})',
+                'hints': ['Reduce section divider slides and expand substantive content pages instead.'],
+            }
+        )
+
+    required_substantive = _required_substantive_slides(total_slides)
+    if substantive_count < required_substantive:
+        issues.append(
+            {
+                'level': 'error',
+                'code': 'too_few_substantive_slides',
+                'message': (
+                    f'too few substantive body slides: {substantive_count}/{total_slides}; '
+                    f'require at least {required_substantive}'
+                ),
+                'hints': [
+                    'Increase content-rich body slides with bullets/cards/table/process/timeline details.',
+                    'Do not count cover/toc/section/closing pages as substantive body content.',
+                ],
+            }
+        )
 
     if len(seen_layouts) <= 1 and len(normalized.get('slides') or []) > 2:
         warnings.append({'level': 'warning', 'code': 'layout_repetition', 'message': 'most slides use the same layout; visual rhythm may be weak'})
