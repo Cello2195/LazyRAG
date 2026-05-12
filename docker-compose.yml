@@ -592,6 +592,7 @@ services:
       - "8046"
     volumes:
       - ./data/core/uploads:/var/lib/lazyrag/uploads
+      - ./skills:/app/skills:ro
     healthcheck:
       test: ['CMD-SHELL', 'curl -sf http://localhost:8046/docs || exit 1']
       interval: 10s
@@ -614,6 +615,7 @@ services:
       LAZYRAG_MAX_RETRIES: ${LAZYRAG_MAX_RETRIES:-20}
       LAZYRAG_REVIEW_MAX_RETRIES: ${LAZYRAG_REVIEW_MAX_RETRIES:-5}
       LAZYRAG_MEMORY_REVIEW_INTERVAL: ${LAZYRAG_MEMORY_REVIEW_INTERVAL:-1}
+      LAZYRAG_SKILL_FS_URL: ${LAZYRAG_SKILL_FS_URL:-/app/skills}
       LAZYRAG_SKILL_REVIEW_INTERVAL: ${LAZYRAG_SKILL_REVIEW_INTERVAL:-5}
       LAZYRAG_SKILL_REVIEW_DEBUG: ${LAZYRAG_SKILL_REVIEW_DEBUG:-false}
       LAZYRAG_CORE_SERVICE_URL: ${LAZYRAG_CORE_SERVICE_URL:-http://core:8000}
