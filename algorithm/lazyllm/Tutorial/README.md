@@ -1,2 +1,0 @@
-# Tutorial
-Tutorial of LazyLLM

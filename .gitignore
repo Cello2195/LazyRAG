@@ -124,3 +124,6 @@ playwright-report/
 
 # generated/local binaries
 backend/file-watcher/file_watcher
+
+# Ignore LazyLLM tutorial assets
+algorithm/lazyllm/Tutorial/
