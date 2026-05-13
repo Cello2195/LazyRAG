@@ -1,7 +1,10 @@
 from typing import Dict, Union, Any, List, Callable, Optional
 from ...common import LazyLLMRegisterMetaClass
 from lazyllm import LOG
-import json5 as json
+try:
+    import json5 as json
+except Exception:  # pragma: no cover - optional dependency
+    import json
 from functools import reduce
 import copy
 import re

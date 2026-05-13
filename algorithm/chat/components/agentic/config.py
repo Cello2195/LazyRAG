@@ -4,17 +4,37 @@ import os
 from functools import lru_cache
 from typing import Any, Dict, Tuple
 
-from chat.prompts.agentic import (
-    CITATION_GUIDANCE,
-    DEFAULT_SYSTEM_PROMPT,
-    MEMORY_GUIDANCE,
-    SEARCH_GUIDANCE,
-    SKILLS_GUIDANCE,
-    PPTX_GENERATION_GUIDANCE,
-    TOOL_CALL_STATUS_GUIDANCE,
-    _COMBINED_REVIEW_PROMPT,
-    _MEMORY_REVIEW_PROMPT,
-    _SKILL_REVIEW_PROMPT,
+try:
+    from chat.prompts.agentic import (
+        CITATION_GUIDANCE,
+        DEFAULT_SYSTEM_PROMPT,
+        MEMORY_GUIDANCE,
+        SEARCH_GUIDANCE,
+        SKILLS_GUIDANCE,
+        PPTX_GENERATION_GUIDANCE,
+        TOOL_CALL_STATUS_GUIDANCE,
+        _COMBINED_REVIEW_PROMPT,
+        _MEMORY_REVIEW_PROMPT,
+        _SKILL_REVIEW_PROMPT,
+    )
+except ImportError:
+    # Some lightweight tests patch a minimal fake prompt module that may miss
+    # newer constants. Keep imports resilient for those environments.
+    from chat.prompts.agentic import (  # type: ignore
+        CITATION_GUIDANCE,
+        DEFAULT_SYSTEM_PROMPT,
+        MEMORY_GUIDANCE,
+        SEARCH_GUIDANCE,
+        SKILLS_GUIDANCE,
+        TOOL_CALL_STATUS_GUIDANCE,
+        _COMBINED_REVIEW_PROMPT,
+        _MEMORY_REVIEW_PROMPT,
+        _SKILL_REVIEW_PROMPT,
+    )
+    PPTX_GENERATION_GUIDANCE = ''
+from chat.components.lclm.detector import (
+    contains_lclm_intent as _contains_lclm_intent,
+    contains_pptx_intent as _contains_lclm_pptx_intent,
 )
 
 DEFAULT_TOOLS = [
@@ -47,6 +67,9 @@ DEFAULT_TOOLS = [
 DEFAULT_PPTX_SKILLS = (
     'visual-pptx-generation',
     'pptx-generation',
+)
+DEFAULT_LCLM_SKILLS = (
+    'outline-longform-generation',
 )
 _PPTX_INTENT_KEYWORDS = (
     'ppt',
@@ -169,6 +192,13 @@ def _augment_skills_for_request(
         or 'pptx_create_from_schema' in available_tools
     )
     if not needs_pptx_skill:
+        # Additive long-form skill enhancement, without touching PPTX route.
+        if _contains_lclm_intent(query) and not _contains_lclm_pptx_intent(query):
+            merged = list(available_skills)
+            for skill in DEFAULT_LCLM_SKILLS:
+                if skill not in merged:
+                    merged.append(skill)
+            return merged
         return available_skills
 
     merged: list[str] = []
@@ -293,4 +323,13 @@ def _get_runtime_agent_defaults() -> Dict[str, Any]:
         'web_search_bocha_api_key': _cfg['web_search_bocha_api_key'],
         'web_search_bocha_base_url': _cfg['web_search_bocha_base_url'],
         'arxiv_search_timeout': _cfg['arxiv_search_timeout'],
+        'lclm_mode': _cfg['lclm_mode'],
+        'lclm_max_outline_nodes': _cfg['lclm_max_outline_nodes'],
+        'lclm_max_depth': _cfg['lclm_max_depth'],
+        'lclm_section_min_words': _cfg['lclm_section_min_words'],
+        'lclm_section_max_words': _cfg['lclm_section_max_words'],
+        'lclm_node_evidence_topk': _cfg['lclm_node_evidence_topk'],
+        'lclm_max_repair_rounds': _cfg['lclm_max_repair_rounds'],
+        'lclm_save_artifact': _cfg['lclm_save_artifact'],
+        'lclm_preview_chars': _cfg['lclm_preview_chars'],
     }

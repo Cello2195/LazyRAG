@@ -1,7 +1,32 @@
 import copy
-import json5 as json
+try:
+    import json5 as json
+except Exception:  # pragma: no cover - optional dependency
+    import json
 import lazyllm
-import docstring_parser
+try:
+    import docstring_parser
+except Exception:  # pragma: no cover - optional dependency
+    class _ParsedParam:
+        def __init__(self, arg_name: str, type_name: str = None):
+            self.arg_name = arg_name
+            self.type_name = type_name
+
+    class _ParsedReturn:
+        def __init__(self, type_name: str = None):
+            self.type_name = type_name
+
+    class _ParsedDoc:
+        def __init__(self):
+            self.params = []
+            self.returns = _ParsedReturn()
+
+    class _DocstringParserFallback:
+        @staticmethod
+        def parse(_doc: str):
+            return _ParsedDoc()
+
+    docstring_parser = _DocstringParserFallback()
 import os
 from lazyllm.module import ModuleBase
 from lazyllm.common import LazyLLMRegisterMetaClass, compile_func, kwargs

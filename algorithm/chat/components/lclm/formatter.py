@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Callable, List, Mapping, Optional
+
+from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode
+from chat.prompts.lclm import FINAL_FORMAT_PROMPT, GLOBAL_REVISION_PROMPT
+
+
+def _heading_for_node(node: OutlineNode) -> str:
+    if node.level <= 1:
+        return f'## {node.node_id}. {node.title}'
+    return f'### {node.node_id} {node.title}'
+
+
+def _strip_leading_headings(markdown: str) -> str:
+    lines = str(markdown or '').splitlines()
+    while lines and lines[0].strip().startswith('#'):
+        lines.pop(0)
+    return '\n'.join(lines).strip()
+
+
+def _clean_conclusion(text: str) -> str:
+    cleaned = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if not cleaned:
+        return ''
+    return cleaned[:220]
+
+
+def _core_conclusion(
+    *,
+    task: LongFormTaskSchema,
+    section_summaries: Mapping[str, str],
+) -> str:
+    summaries = [str(v).strip() for _, v in sorted(section_summaries.items()) if str(v).strip()]
+    if summaries:
+        joined = '；'.join(summaries[:3])
+        return _clean_conclusion(joined)
+    return _clean_conclusion(
+        f'围绕“{task.query}”，本报告给出结构化分析与可执行建议；当前结论优先遵循证据约束，并标注了后续需要补强的环节。'
+    )
+
+
+def _to_txt(markdown: str) -> str:
+    text = re.sub(r'^\s*#{1,6}\s*', '', markdown, flags=re.MULTILINE)
+    text = text.replace('> ', '')
+    return text
+
+
+def _to_html(markdown: str) -> str:
+    body = markdown
+    body = re.sub(r'^###\s+(.*)$', r'<h3>\1</h3>', body, flags=re.MULTILINE)
+    body = re.sub(r'^##\s+(.*)$', r'<h2>\1</h2>', body, flags=re.MULTILINE)
+    body = re.sub(r'^#\s+(.*)$', r'<h1>\1</h1>', body, flags=re.MULTILINE)
+    body = re.sub(r'^\>\s*(.*)$', r'<blockquote>\1</blockquote>', body, flags=re.MULTILINE)
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', body) if p.strip()]
+    html_parts = []
+    for part in paragraphs:
+        if part.startswith('<h') or part.startswith('<blockquote>'):
+            html_parts.append(part)
+        else:
+            html_parts.append(f'<p>{part}</p>')
+    html_body = '\n'.join(html_parts)
+    return (
+        '<!doctype html>\n'
+        '<html lang="zh-CN">\n'
+        '<head><meta charset="utf-8"><title>LongForm Report</title></head>\n'
+        f'<body>\n{html_body}\n</body>\n</html>'
+    )
+
+
+def _fill_prompt(template: str, **kwargs: Any) -> str:
+    text = str(template)
+    for key, value in kwargs.items():
+        text = text.replace(f'{{{key}}}', str(value))
+    return text
+
+
+class LongFormFormatter:
+    def __init__(self, llm_callable: Optional[Callable[[str], Any]] = None):
+        self._llm = llm_callable
+
+    def _call_llm(self, prompt: str) -> Optional[str]:
+        if not callable(self._llm):
+            return None
+        try:
+            out = self._llm(prompt)
+        except Exception:
+            return None
+        if out is None:
+            return None
+        if isinstance(out, dict):
+            text = out.get('text') or out.get('content') or out.get('message')
+            if isinstance(text, str):
+                return text
+            return json.dumps(out, ensure_ascii=False)
+        return str(out)
+
+    def compose_markdown(
+        self,
+        *,
+        title: str,
+        task: LongFormTaskSchema,
+        outline: List[OutlineNode],
+        section_summaries: Mapping[str, str],
+        warnings: List[str],
+        runtime_params: Mapping[str, Any],
+    ) -> str:
+        sections: list[str] = []
+        for node in outline:
+            body = _strip_leading_headings(node.draft)
+            if not body:
+                continue
+            sections.append(f'{_heading_for_node(node)}\n\n{body}')
+
+        core = _core_conclusion(task=task, section_summaries=section_summaries)
+        markdown = '\n\n'.join(
+            [
+                f'# {title}',
+                f'> 核心结论：{core}',
+                *sections,
+                '## 8. 总结\n\n本报告基于 outline-first 工作流完成，优先保证结构完整、证据对齐和可执行建议。',
+            ]
+        ).strip()
+
+        if warnings:
+            warning_lines = '\n'.join(f'- {item}' for item in warnings if item)
+            markdown += f'\n\n## 9. 风险与补充说明\n\n{warning_lines}'
+
+        if callable(self._llm):
+            rev_prompt = _fill_prompt(
+                GLOBAL_REVISION_PROMPT,
+                task_json=json.dumps(task.to_dict(), ensure_ascii=False, indent=2),
+                document_markdown=markdown,
+            )
+            revised = self._call_llm(rev_prompt)
+            if revised and len(revised.strip()) > 80:
+                markdown = revised.strip()
+
+            fmt_prompt = _fill_prompt(
+                FINAL_FORMAT_PROMPT,
+                document_markdown=markdown,
+                output_format=task.output_format,
+            )
+            formatted = self._call_llm(fmt_prompt)
+            if formatted and len(formatted.strip()) > 80:
+                markdown = formatted.strip()
+
+        return markdown
+
+    def render_output(self, markdown: str, output_format: str) -> str:
+        fmt = str(output_format or 'markdown').strip().lower()
+        if fmt == 'txt':
+            return _to_txt(markdown)
+        if fmt == 'html':
+            return _to_html(markdown)
+        return markdown

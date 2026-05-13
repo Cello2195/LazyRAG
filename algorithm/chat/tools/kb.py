@@ -7,7 +7,6 @@ import requests
 
 from lazyllm import fc_register
 
-from chat.pipelines.builders.get_ppl_search import get_ppl_search
 from config import config as _cfg
 
 _MAX_TEXT_LEN = 1200
@@ -470,6 +469,9 @@ def kb_search(
     resolved_kb_id = _resolve_kb_id(agentic_config)
     if resolved_kb_id:
         payload['filters']['kb_id'] = resolved_kb_id
+    # Lazy import to avoid pulling full RAG dependency stack at module import
+    # time when tests only touch helper behavior.
+    from chat.pipelines.builders.get_ppl_search import get_ppl_search
     search_ppl = get_ppl_search(
         url=f'{kb_url},{kb_name}',
         retriever_configs=retriever_configs,

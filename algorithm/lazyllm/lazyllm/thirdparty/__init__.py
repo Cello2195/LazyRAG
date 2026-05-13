@@ -3,7 +3,7 @@ import toml
 import re
 import os
 import lazyllm
-from typing import List, Any
+from typing import List, Any, Union
 from lazyllm.common import LOG
 from lazyllm.configs import config
 from .modules import modules
@@ -158,7 +158,7 @@ def check_packages(names):
         cmd = get_pip_install_cmd(missing_pack)
         LOG.warning(f'Some packages are not found, please install it by \'{cmd}\'')
 
-def check_package_installed(package_name: str | List[str]) -> bool:
+def check_package_installed(package_name: Union[str, List[str]]) -> bool:
     if isinstance(package_name, list):
         for name in package_name:
             if importlib.util.find_spec(name) is None:

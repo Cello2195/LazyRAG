@@ -54,6 +54,15 @@ config.add('skill_review_interval', int, 5, 'SKILL_REVIEW_INTERVAL', description
 config.add('review_max_retries', int, 5, 'REVIEW_MAX_RETRIES', description='Max retries for background review agent.')
 config.add('skill_review_debug', bool, False, 'SKILL_REVIEW_DEBUG', description='Enable skill review debug logging.')
 config.add('review_debug', bool, False, 'REVIEW_DEBUG', description='Enable review debug logging.')
+config.add('lclm_mode', str, 'auto', 'LCLM_MODE', description='Long-form generation mode: auto/off/force.')
+config.add('lclm_max_outline_nodes', int, 8, 'LCLM_MAX_OUTLINE_NODES', description='Maximum outline nodes for LCLM planning.')
+config.add('lclm_max_depth', int, 3, 'LCLM_MAX_DEPTH', description='Maximum outline depth for LCLM planning.')
+config.add('lclm_section_min_words', int, 180, 'LCLM_SECTION_MIN_WORDS', description='Minimum target words per LCLM section.')
+config.add('lclm_section_max_words', int, 900, 'LCLM_SECTION_MAX_WORDS', description='Maximum target words per LCLM section.')
+config.add('lclm_node_evidence_topk', int, 5, 'LCLM_NODE_EVIDENCE_TOPK', description='Maximum evidence cards per outline node.')
+config.add('lclm_max_repair_rounds', int, 1, 'LCLM_MAX_REPAIR_ROUNDS', description='Max repair rounds per LCLM section/global pass.')
+config.add('lclm_save_artifact', bool, True, 'LCLM_SAVE_ARTIFACT', description='Whether LCLM should persist report artifacts.')
+config.add('lclm_preview_chars', int, 1500, 'LCLM_PREVIEW_CHARS', description='Preview length for LCLM final response text.')
 
 # ---------------------------------------------------------------------------
 # Parsing

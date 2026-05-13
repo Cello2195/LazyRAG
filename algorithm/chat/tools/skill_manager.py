@@ -364,17 +364,34 @@ def skill_manage(
                 f'{source!r}; skill_manage can only modify remote skills.'
             )
 
+        normalized_suggestions: List[Dict[str, str]] = []
+        for suggestion in suggestions:
+            if isinstance(suggestion, Suggestion):
+                normalized_suggestions.append(suggestion.model_dump())
+                continue
+            if isinstance(suggestion, dict):
+                try:
+                    normalized_suggestions.append(Suggestion.model_validate(suggestion).model_dump())
+                    continue
+                except Exception:
+                    return _fail(
+                        "Each suggestion must include non-empty string fields 'title' and 'content'."
+                    )
+            return _fail(
+                "Each suggestion must be either a Suggestion object or a dict with 'title'/'content'."
+            )
+
         result = {
             'name': name,
             'action': action,
             'category': normalized_category,
-            'suggestions': [s.model_dump() for s in suggestions],
+            'suggestions': normalized_suggestions,
         }
         payload = {
             'session_id': session_id,
             'skill_name': name,
             'category': normalized_category,
-            'suggestions': [s.model_dump() for s in suggestions],
+            'suggestions': normalized_suggestions,
         }
         try:
             result.update(_post_core_api('/skill/suggestion', payload))
@@ -407,8 +424,9 @@ def skill_manage(
             'session_id': session_id,
             'skill_name': name,
             'category': normalized_category,
-            'reason': reason or '',
         }
+        if reason:
+            payload['reason'] = reason
         try:
             result.update(_post_core_api('/skill/remove', payload))
         except (requests.RequestException, RuntimeError) as exc:

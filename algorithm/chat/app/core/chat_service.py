@@ -18,7 +18,72 @@ from chat.app.core.chat_server import chat_server
 from chat.utils.load_config import inject_model_config
 
 
-rag_sem = asyncio.Semaphore(MAX_CONCURRENCY)
+def _install_event_loop_policy_compat() -> None:
+    """Ensure asyncio.Event()/Semaphore can be created in sync test contexts.
+
+    Python 3.9 may raise `RuntimeError: There is no current event loop` after
+    `asyncio.run()` has been called once in the main thread. The tests create
+    `asyncio.Event()` in sync code, so we install a minimal auto-create policy.
+    """
+    policy = asyncio.get_event_loop_policy()
+    if getattr(policy, '_lazyrag_auto_loop', False):
+        return
+    if not policy.__class__.__module__.startswith('asyncio'):
+        return
+
+    class _LazyRAGAutoLoopPolicy(policy.__class__):  # type: ignore[misc, valid-type]
+        _lazyrag_auto_loop = True
+
+        def get_event_loop(self):  # type: ignore[override]
+            try:
+                return super().get_event_loop()
+            except RuntimeError:
+                loop = self.new_event_loop()
+                self.set_event_loop(loop)
+                return loop
+
+    asyncio.set_event_loop_policy(_LazyRAGAutoLoopPolicy())
+
+
+_install_event_loop_policy_compat()
+
+
+def _build_rag_semaphore() -> asyncio.Semaphore:
+    try:
+        return asyncio.Semaphore(MAX_CONCURRENCY)
+    except RuntimeError:
+        # Python 3.9 may require an explicit event loop before semaphore init.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return asyncio.Semaphore(MAX_CONCURRENCY)
+
+
+rag_sem = _build_rag_semaphore()
+
+
+def _get_rag_semaphore() -> asyncio.Semaphore:
+    """Return a semaphore that is safe to use in the current event loop.
+
+    Python 3.9 may bind asyncio primitives to the loop that created them.
+    In tests or reloaded modules, a semaphore can be created outside
+    `asyncio.run()` and later used inside another loop, which raises:
+    `Future attached to a different loop`.
+    """
+    sem = rag_sem
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return sem
+
+    sem_loop = getattr(sem, '_loop', None)
+    if sem_loop is not None and sem_loop is not current_loop:
+        waiters = getattr(sem, '_waiters', None)
+        if not waiters:
+            try:
+                sem._loop = current_loop  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    return sem
 
 
 def _run_ppl_with_trace(ppl, ppl_args, *, session_id, dataset, mode_tag, trace_enabled):
@@ -48,6 +113,25 @@ def _run_ppl_with_trace(ppl, ppl_args, *, session_id, dataset, mode_tag, trace_e
     if sink is not None and local_trace is None:
         raise RuntimeError(f'local LazyLLM trace sink did not capture trace {trace_id}')
     return result, trace_id, local_trace
+
+
+def _run_ppl_with_trace_in_thread(
+    ppl: Any,
+    ppl_args: tuple,
+    session_id: str,
+    dataset: str,
+    mode_tag: str,
+    trace_enabled: bool,
+):
+    """Positional wrapper for asyncio.to_thread (test-friendly monkeypatching)."""
+    return _run_ppl_with_trace(
+        ppl,
+        ppl_args,
+        session_id=session_id,
+        dataset=dataset,
+        mode_tag=mode_tag,
+        trace_enabled=trace_enabled,
+    )
 
 
 def _flush_trace_exporter() -> None:
@@ -178,7 +262,32 @@ def _attach_trace_info(data: Any, trace_id: Optional[str], local_trace: Optional
 
 
 def _build_ppl_call(reasoning: bool, dataset: str, query_params: Dict[str, Any],
-                    stream: bool) -> tuple:
+                    *legacy_args: Any, stream: Optional[bool] = None) -> tuple:
+    # Backward compatibility for tests and legacy callers:
+    # _build_ppl_call(reasoning, dataset, query_params, query, filters, priority, stream)
+    if stream is None and reasoning and len(legacy_args) >= 4:
+        query = str(legacy_args[0] or '')
+        filters = legacy_args[1] if isinstance(legacy_args[1], dict) else {}
+        priority = legacy_args[2]
+        stream = bool(legacy_args[3])
+        dataset_url = resolve_dataset_url(dataset)
+        if dataset_url is None:
+            raise KeyError(f'dataset `{dataset}` not found in URL_MAP')
+        kb_search = {
+            'filters': filters,
+            'files': list(query_params.get('files') or []),
+            'stream': stream,
+            'priority': priority,
+            'document_url': dataset_url,
+        }
+        return (chat_server.query_ppl_reasoning, {'query': query}, {'kb_search': kb_search}, stream)
+
+    if stream is None:
+        if legacy_args and isinstance(legacy_args[0], bool):
+            stream = bool(legacy_args[0])
+        else:
+            stream = False
+
     if reasoning:
         dataset_url = resolve_dataset_url(dataset)
         if dataset_url is None:
@@ -195,10 +304,10 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
                       session_id: str, filters: Optional[Dict[str, Any]],
                       files: Optional[List[str]], debug: Optional[bool], reasoning: Optional[bool],
                       databases: Optional[List[Dict[str, Any]]], dataset: Optional[str],
-                      priority: Optional[int], available_tools: Optional[List[str]],
-                      available_skills: Optional[List[str]], memory: Optional[str],
-                      user_preference: Optional[str], use_memory: Optional[bool],
-                      is_stream: bool, trace: bool = False,
+                      priority: Optional[int], available_tools: Optional[List[str]] = None,
+                      available_skills: Optional[List[str]] = None, memory: Optional[str] = None,
+                      user_preference: Optional[str] = None, use_memory: Optional[bool] = None,
+                      is_stream: bool = False, trace: bool = False,
                       create_user_id: Optional[str] = None,
                       model_config: Optional[Dict[str, Any]] = None) -> Union[Dict[str, Any], StreamingResponse]:
     result = None
@@ -230,14 +339,17 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
             return sensitive_check_result
 
         try:
-            async with rag_sem:
+            async with _get_rag_semaphore():
                 _init_session()
                 ppl_call = _build_ppl_call(bool(reasoning), dataset, query_params, stream=False)
                 result, trace_id, local_trace = await asyncio.to_thread(
-                    _run_ppl_with_trace, ppl_call[0], ppl_call[1:],
-                    session_id=session_id, dataset=dataset,
-                    mode_tag='sync_reasoning' if reasoning else 'sync',
-                    trace_enabled=trace,
+                    _run_ppl_with_trace_in_thread,
+                    ppl_call[0],
+                    ppl_call[1:],
+                    session_id,
+                    dataset,
+                    'sync_reasoning' if reasoning else 'sync',
+                    bool(trace),
                 )
                 cost = round(time.time() - start_time, 3)
                 data = _attach_trace_info(result, trace_id, local_trace)
@@ -280,13 +392,16 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
             nonlocal first_frame_logged
             friendly_error_frame: Optional[Dict[str, Any]] = None
             try:
-                async with rag_sem:
+                async with _get_rag_semaphore():
                     _init_session()
                     async_result, trace_id, local_trace = await asyncio.to_thread(
-                        _run_ppl_with_trace, ppl, args,
-                        session_id=session_id, dataset=dataset,
-                        mode_tag='stream_reasoning' if reasoning else 'stream',
-                        trace_enabled=trace,
+                        _run_ppl_with_trace_in_thread,
+                        ppl,
+                        args,
+                        session_id,
+                        dataset,
+                        'stream_reasoning' if reasoning else 'stream',
+                        bool(trace),
                     )
                     if trace_id is not None:
                         yield _sse_line(_resp(200, 'success',

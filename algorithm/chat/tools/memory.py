@@ -140,12 +140,28 @@ def memory(
         return _fail(
             f"Unknown target {target!r}; expected one of 'memory', 'user'."
         )
-    if not suggestions:
+    normalized_suggestions: List[Dict[str, str]] = []
+    if isinstance(suggestions, str):
+        normalized_suggestions = [{'title': 'suggestion', 'content': suggestions}]
+    elif isinstance(suggestions, dict):
+        normalized_suggestions = [dict(suggestions)]
+    elif isinstance(suggestions, (list, tuple)):
+        for item in suggestions:
+            if isinstance(item, str):
+                normalized_suggestions.append({'title': 'suggestion', 'content': item})
+            elif isinstance(item, dict):
+                normalized_suggestions.append(dict(item))
+            else:
+                return _fail("'suggestions' items must be dicts or strings.")
+    else:
         return _fail("'suggestions' must be a non-empty list.")
-    if len(suggestions) > MAX_SUGGESTIONS_PER_CALL:
+
+    if not normalized_suggestions:
+        return _fail("'suggestions' must be a non-empty list.")
+    if len(normalized_suggestions) > MAX_SUGGESTIONS_PER_CALL:
         return _fail(
             f'At most {MAX_SUGGESTIONS_PER_CALL} suggestions are allowed per '
-            f'call; got {len(suggestions)}.'
+            f'call; got {len(normalized_suggestions)}.'
         )
 
     agentic_config = _agentic_config()
@@ -160,12 +176,12 @@ def memory(
     )
     payload = {
         'session_id': session_id,
-        'suggestions': [dict(s) for s in suggestions],
+        'suggestions': normalized_suggestions,
     }
 
     result: Dict[str, Any] = {
         'target': target,
-        'appended_suggestions': len(suggestions),
+        'appended_suggestions': len(normalized_suggestions),
     }
     try:
         result.update(_post_core_api(endpoint, payload))

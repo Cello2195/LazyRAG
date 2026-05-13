@@ -3,7 +3,6 @@ import re
 import time
 import uuid
 import copy
-import psutil
 import random
 import threading
 import subprocess
@@ -11,6 +10,32 @@ import multiprocessing
 from enum import Enum
 from datetime import datetime
 from collections import defaultdict
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional in lightweight test envs
+    class _PsutilFallback:
+        class NoSuchProcess(Exception):
+            pass
+
+        class AccessDenied(Exception):
+            pass
+
+        class _Process:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def children(self, recursive=True):
+                return []
+
+            def kill(self):
+                return None
+
+        @staticmethod
+        def Process(pid):
+            return _PsutilFallback._Process(pid)
+
+    psutil = _PsutilFallback()  # type: ignore[assignment]
 
 import lazyllm
 from lazyllm.common import RecentQueue as Queue

@@ -1,5 +1,8 @@
 import functools
-import json5 as json
+try:
+    import json5 as json
+except Exception:  # pragma: no cover - optional dependency
+    import json
 from datetime import datetime
 from typing import Optional, Dict, List, Any, Union, Tuple
 import os

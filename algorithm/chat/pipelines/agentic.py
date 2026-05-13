@@ -30,6 +30,7 @@ from chat.components.agentic.config import (  # noqa: E402
     _normalize_available_tools,
     _sync_request_context,
 )
+from chat.components.lclm.detector import should_use_lclm  # noqa: E402
 from chat.components.agentic.history import (  # noqa: E402
     _build_stream_citation_scanner,
     _count_tool_turns,
@@ -51,7 +52,6 @@ from chat.components.agentic.tool_stream import (  # noqa: E402
     _tool_call_id,
 )
 from lazyllm import AutoModel  # noqa: E402
-from chat.utils.load_config import get_config_path  # noqa: E402
 
 
 class _StreamingFunctionCall(FunctionCall):
@@ -172,11 +172,19 @@ def agentic_forward(
     stream_event_callback=None,
 ) -> Any:
     config = lazyllm.globals['agentic_config'] or {}
-    lazyllm.LOG.warning(f'config: {config}')
+    logger = getattr(lazyllm, 'LOG', None)
+    log_warning = getattr(logger, 'warning', None) or getattr(logger, 'info', None)
+    if callable(log_warning):
+        log_warning(f'config: {config}')
     if not isinstance(config, dict):
         config = {}
 
-    llm = AutoModel(model='llm', config=get_config_path())
+    try:
+        from chat.utils.load_config import get_config_path
+        model_config_path = get_config_path()
+    except Exception:
+        model_config_path = False
+    llm = AutoModel(model='llm', config=model_config_path)
     available_tools = _filter_tools_for_request(
         _normalize_available_tools(config.get('available_tools')),
         config,
@@ -266,9 +274,11 @@ def agentic_forward(
 
 
 def _lazyllm_queue_db_path() -> Path:
-    from lazyllm.configs import config
-
-    home = Path(os.path.expanduser(config['home']))
+    try:
+        from lazyllm.configs import config
+        home = Path(os.path.expanduser(config['home']))
+    except Exception:
+        home = Path(os.path.expanduser('~/.lazyllm_rag'))
     return home / '.lazyllm_filesystem_queue.db'
 
 
@@ -422,6 +432,68 @@ def get_ppl_agentic():
     return agentic_rag
 
 
+def _run_lclm_pipeline(
+    *,
+    query: str,
+    history: list[dict[str, Any]],
+    runtime_params: dict[str, Any],
+) -> dict[str, Any]:
+    from chat.components.lclm.pipeline import run_outline_longform
+
+    result = run_outline_longform(
+        query=query,
+        history=history,
+        runtime_params=runtime_params,
+    )
+    return result if isinstance(result, dict) else {'text': str(result or '')}
+
+
+async def _lclm_forward_stream(
+    *,
+    query: str,
+    history: list[dict[str, Any]],
+    runtime_params: dict[str, Any],
+    global_sid: str,
+    local_sid: str,
+):
+    chunk_size = int(runtime_params.get('stream_chunk_size') or _STREAM_CHUNK_SIZE)
+    try:
+        lazyllm.globals._init_sid(global_sid)
+        lazyllm.locals._init_sid(local_sid)
+        lazyllm.globals['agentic_config'] = runtime_params
+        result = await asyncio.to_thread(
+            _run_lclm_pipeline,
+            query=query,
+            history=history,
+            runtime_params=runtime_params,
+        )
+        output = _format_non_stream_result(result, runtime_params)
+        think = str(output.get('think') or '')
+        text = str(output.get('text') or '')
+        for chunk in _iter_text_chunks(think, chunk_size):
+            yield _stream_frame(think=chunk)
+        for chunk in _iter_text_chunks(text, chunk_size):
+            yield _stream_frame(text=chunk)
+        sources = output.get('sources') or []
+        if sources:
+            yield _stream_frame(text='', sources=sources)
+        extra = {}
+        for key in ('artifact', 'download_link', 'download_url'):
+            if output.get(key):
+                extra[key] = output.get(key)
+        if extra:
+            yield _stream_frame(text='', extra=extra)
+    except Exception:
+        async for frame in _agentic_forward_stream(
+            query=query,
+            history=history,
+            runtime_params=runtime_params,
+            global_sid=global_sid,
+            local_sid=local_sid,
+        ):
+            yield frame
+
+
 def agentic_rag(
     global_params: Dict[str, Any],
     tool_params: Optional[Dict[str, Any]] = None,
@@ -449,6 +521,28 @@ def agentic_rag(
     history = _normalize_history_for_agent(history, runtime_params)
 
     lazyllm.globals['agentic_config'] = runtime_params
+
+    use_lclm, lclm_reason = should_use_lclm(query, runtime_params)
+    runtime_params['lclm_decision'] = lclm_reason
+    if use_lclm:
+        if not stream:
+            try:
+                lclm_result = _run_lclm_pipeline(
+                    query=query.strip(),
+                    history=history,
+                    runtime_params=runtime_params,
+                )
+                return _format_non_stream_result(lclm_result, runtime_params)
+            except Exception:
+                result = agentic_forward(query=query.strip(), history=history)
+                return _format_non_stream_result(result, runtime_params)
+        return _lclm_forward_stream(
+            query=query.strip(),
+            history=history,
+            runtime_params=runtime_params,
+            global_sid=lazyllm.globals._sid,
+            local_sid=lazyllm.locals._sid,
+        )
 
     if not stream:
         result = agentic_forward(query=query.strip(), history=history)

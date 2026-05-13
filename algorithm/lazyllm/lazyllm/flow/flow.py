@@ -468,17 +468,16 @@ class Parallel(LazyLLMFlowsBase):
         self._concurrent = 0 if not _concurrent else 5 if isinstance(_concurrent, bool) else _concurrent
         self._scatter = _scatter
 
-    @staticmethod
     def _set_status(self, type, args=None):
         assert self._post_process_type is Parallel.PostProcessType.NONE, 'Cannor set post process twice'
         self._post_process_type = type
         self._post_process_args = args
         return self
 
-    asdict = property(partial(_set_status, type=PostProcessType.DICT))
-    astuple = property(partial(_set_status, type=PostProcessType.TUPLE))
-    aslist = property(partial(_set_status, type=PostProcessType.LIST))
-    sum = property(partial(_set_status, type=PostProcessType.SUM))
+    asdict = property(lambda self: self._set_status(type=Parallel.PostProcessType.DICT))
+    astuple = property(lambda self: self._set_status(type=Parallel.PostProcessType.TUPLE))
+    aslist = property(lambda self: self._set_status(type=Parallel.PostProcessType.LIST))
+    sum = property(lambda self: self._set_status(type=Parallel.PostProcessType.SUM))
 
     def join(self, string=''):
         assert isinstance(string, str), 'argument of join shoule be str'
