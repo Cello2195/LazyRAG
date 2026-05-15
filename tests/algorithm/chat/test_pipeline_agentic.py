@@ -279,3 +279,132 @@ def test_agentic_forward_uses_automodel(monkeypatch):
     module.agentic_forward(query='hello', history=[])
 
     assert automodel_calls == ['model:llm']
+
+
+def test_agentic_rag_force_mode_does_not_fallback_when_lclm_fails(monkeypatch):
+    module = _import_agentic_module(monkeypatch)
+    monkeypatch.setattr(module, '_ensure_tools_registered', lambda: None)
+    monkeypatch.setattr(module, '_get_runtime_agent_defaults', lambda: {})
+    module.lazyllm.globals = {
+        'agentic_config': {},
+    }
+    module.lazyllm.locals = SimpleNamespace(_sid='test-local-sid')
+    monkeypatch.setattr(module, 'should_use_lclm', lambda q, p: (True, 'mode_force'))
+    monkeypatch.setattr(
+        module,
+        '_run_lclm_pipeline',
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError('lclm boom')),
+    )
+    fallback_called = {'called': False}
+
+    def fake_fallback(**kwargs):
+        fallback_called['called'] = True
+        del kwargs
+        return 'fallback'
+
+    monkeypatch.setattr(module, 'agentic_forward', fake_fallback)
+
+    try:
+        module.agentic_rag({'query': '请详细调研', 'history': [], 'lclm_mode': 'force'}, stream=False)
+    except RuntimeError as exc:
+        assert 'lclm boom' in str(exc)
+    else:
+        raise AssertionError('force mode should re-raise lclm errors')
+
+    assert fallback_called['called'] is False
+
+
+def test_agentic_rag_auto_mode_fallbacks_when_lclm_fails(monkeypatch):
+    module = _import_agentic_module(monkeypatch)
+    monkeypatch.setattr(module, '_ensure_tools_registered', lambda: None)
+    monkeypatch.setattr(module, '_get_runtime_agent_defaults', lambda: {})
+    module.lazyllm.globals = {
+        'agentic_config': {},
+    }
+    module.lazyllm.locals = SimpleNamespace(_sid='test-local-sid')
+    monkeypatch.setattr(module, 'should_use_lclm', lambda q, p: (True, 'keyword_match'))
+    monkeypatch.setattr(
+        module,
+        '_run_lclm_pipeline',
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError('lclm boom')),
+    )
+    monkeypatch.setattr(module, 'agentic_forward', lambda **kwargs: 'fallback answer')
+
+    out = module.agentic_rag({'query': '请详细调研', 'history': [], 'lclm_mode': 'auto'}, stream=False)
+
+    assert isinstance(out, dict)
+    assert out.get('text') == 'fallback answer'
+
+
+def test_merge_lclm_runtime_params_promotes_filter_fields(monkeypatch):
+    module = _import_agentic_module(monkeypatch)
+
+    merged = module.merge_lclm_runtime_params(
+        {
+            'lclm_mode': 'auto',
+            'filters': {
+                'scope': 'all',
+                'lclm_mode': 'force',
+                'lclm_enable_evidence': False,
+            },
+        },
+        {'lclm_max_outline_nodes': 1},
+    )
+
+    assert merged['lclm_mode'] == 'force'
+    assert merged['lclm_enable_evidence'] is False
+    assert merged['lclm_max_outline_nodes'] == 1
+    assert merged['filters']['scope'] == 'all'
+
+
+def test_agentic_rag_uses_merged_lclm_runtime_params(monkeypatch):
+    module = _import_agentic_module(monkeypatch)
+    monkeypatch.setattr(module, '_ensure_tools_registered', lambda: None)
+    monkeypatch.setattr(
+        module,
+        '_get_runtime_agent_defaults',
+        lambda: {
+            'lclm_mode': 'auto',
+            'lclm_max_outline_nodes': 8,
+            'lclm_enable_evidence': True,
+            'lclm_use_llm': True,
+        },
+    )
+    module.lazyllm.globals = {
+        'agentic_config': {},
+    }
+    module.lazyllm.locals = SimpleNamespace(_sid='test-local-sid')
+    captured = {}
+
+    def fake_should_use_lclm(query, runtime_params):
+        captured['query'] = query
+        captured['should_runtime'] = dict(runtime_params)
+        return True, 'mode_force'
+
+    def fake_run_lclm_pipeline(*, query, history, runtime_params):
+        captured['run_runtime'] = dict(runtime_params)
+        del history
+        return {'text': f'ok:{query}'}
+
+    monkeypatch.setattr(module, 'should_use_lclm', fake_should_use_lclm)
+    monkeypatch.setattr(module, '_run_lclm_pipeline', fake_run_lclm_pipeline)
+
+    out = module.agentic_rag(
+        {
+            'query': '请详细调研',
+            'history': [],
+            'filters': {
+                'lclm_mode': 'force',
+                'lclm_use_llm': False,
+                'lclm_max_outline_nodes': 1,
+                'lclm_enable_evidence': False,
+            },
+        },
+        stream=False,
+    )
+
+    assert out.get('text') == 'ok:请详细调研'
+    assert captured['should_runtime']['lclm_mode'] == 'force'
+    assert captured['should_runtime']['lclm_use_llm'] is False
+    assert captured['should_runtime']['lclm_max_outline_nodes'] == 1
+    assert captured['run_runtime']['lclm_enable_evidence'] is False

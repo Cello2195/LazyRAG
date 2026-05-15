@@ -615,7 +615,9 @@ func streamSingleAnswer(
 	for d := range ch {
 		if d.ReasoningText != "" {
 			pendingThink += d.ReasoningText
-			continue
+			if d.Text == "" && len(d.Sources) == 0 {
+				continue
+			}
 		}
 		if pendingThink != "" {
 			fullResult += "<think>" + pendingThink + "</think>"
@@ -754,7 +756,9 @@ func streamDualAnswer(
 	appendPrimary := func(delta, reasoning string, sources []any) {
 		if reasoning != "" {
 			primaryPendingThink += reasoning
-			return
+			if delta == "" && len(sources) == 0 {
+				return
+			}
 		}
 		if primaryPendingThink != "" {
 			primaryResult += "<think>" + primaryPendingThink + "</think>"
@@ -784,7 +788,9 @@ func streamDualAnswer(
 	appendSecondary := func(delta, reasoning string, sources []any) {
 		if reasoning != "" {
 			secondaryPendingThink += reasoning
-			return
+			if delta == "" && len(sources) == 0 {
+				return
+			}
 		}
 		if secondaryPendingThink != "" {
 			secondaryResult += "<think>" + secondaryPendingThink + "</think>"

@@ -4,8 +4,33 @@ import json
 import re
 from typing import Any, Callable, List, Mapping, Optional
 
+import lazyllm
+
 from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode
+from chat.components.lclm.text_sanitize import (
+    contains_lclm_pollution,
+    extract_length_constraints,
+    make_rule_fallback_text,
+    sanitize_lclm_text,
+    trim_text_to_units,
+)
 from chat.prompts.lclm import FINAL_FORMAT_PROMPT, GLOBAL_REVISION_PROMPT
+
+
+def _runtime_bool(runtime_params: Mapping[str, Any], key: str, default: bool = False) -> bool:
+    value = runtime_params.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(value)
+
+
+def _log_info(message: str) -> None:
+    logger = getattr(lazyllm, 'LOG', None)
+    fn = getattr(logger, 'info', None)
+    if callable(fn):
+        fn(message)
 
 
 def _heading_for_node(node: OutlineNode) -> str:
@@ -109,7 +134,8 @@ class LongFormFormatter:
     ) -> str:
         sections: list[str] = []
         for node in outline:
-            body = _strip_leading_headings(node.draft)
+            body = sanitize_lclm_text(node.draft)
+            body = _strip_leading_headings(body)
             if not body:
                 continue
             sections.append(f'{_heading_for_node(node)}\n\n{body}')
@@ -128,26 +154,58 @@ class LongFormFormatter:
             warning_lines = '\n'.join(f'- {item}' for item in warnings if item)
             markdown += f'\n\n## 9. 风险与补充说明\n\n{warning_lines}'
 
-        if callable(self._llm):
-            rev_prompt = _fill_prompt(
-                GLOBAL_REVISION_PROMPT,
-                task_json=json.dumps(task.to_dict(), ensure_ascii=False, indent=2),
-                document_markdown=markdown,
-            )
-            revised = self._call_llm(rev_prompt)
-            if revised and len(revised.strip()) > 80:
-                markdown = revised.strip()
+        use_pipeline_llm = _runtime_bool(runtime_params, 'lclm_use_llm', True)
+        use_formatter_llm = _runtime_bool(runtime_params, 'lclm_formatter_use_llm', False)
+        use_global_revision = _runtime_bool(runtime_params, 'lclm_global_revision', False)
+        use_final_format_llm = _runtime_bool(runtime_params, 'lclm_final_format_llm', False)
+        _log_info(
+            '[LCLM] formatter flags '
+            f'use_pipeline_llm={use_pipeline_llm} '
+            f'use_formatter_llm={use_formatter_llm} '
+            f'use_global_revision={use_global_revision} '
+            f'use_final_format_llm={use_final_format_llm}'
+        )
 
-            fmt_prompt = _fill_prompt(
-                FINAL_FORMAT_PROMPT,
-                document_markdown=markdown,
-                output_format=task.output_format,
-            )
-            formatted = self._call_llm(fmt_prompt)
-            if formatted and len(formatted.strip()) > 80:
-                markdown = formatted.strip()
+        if callable(self._llm) and use_pipeline_llm and use_formatter_llm:
+            if use_global_revision:
+                _log_info('[LCLM] formatter global_revision start')
+                rev_prompt = _fill_prompt(
+                    GLOBAL_REVISION_PROMPT,
+                    task_json=json.dumps(task.to_dict(), ensure_ascii=False, indent=2),
+                    document_markdown=markdown,
+                )
+                revised = self._call_llm(rev_prompt)
+                if revised and len(revised.strip()) > 80:
+                    markdown = revised.strip()
+                _log_info('[LCLM] formatter global_revision end')
 
-        return markdown
+            if use_final_format_llm:
+                _log_info('[LCLM] formatter final_format start')
+                fmt_prompt = _fill_prompt(
+                    FINAL_FORMAT_PROMPT,
+                    document_markdown=markdown,
+                    output_format=task.output_format,
+                )
+                formatted = self._call_llm(fmt_prompt)
+                if formatted and len(formatted.strip()) > 80:
+                    markdown = formatted.strip()
+                _log_info('[LCLM] formatter final_format end')
+        else:
+            _log_info('[LCLM] formatter llm skipped')
+
+        markdown = sanitize_lclm_text(markdown)
+        if contains_lclm_pollution(markdown):
+            fallback_topic = task.original_query or task.query or title
+            markdown = (
+                f'# {title}\n\n> 核心结论：'
+                f'{make_rule_fallback_text(fallback_topic, max_units=220)}\n\n'
+                f'## 1. 背景与问题定义\n\n{make_rule_fallback_text(fallback_topic, max_units=320)}'
+            )
+
+        constraints = extract_length_constraints(task.original_query or task.query)
+        if constraints.get('max_units'):
+            markdown = trim_text_to_units(markdown, int(constraints['max_units']) + 40)
+        return markdown.strip()
 
     def render_output(self, markdown: str, output_format: str) -> str:
         fmt = str(output_format or 'markdown').strip().lower()

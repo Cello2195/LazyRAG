@@ -10,6 +10,7 @@ from lazyllm.tracing import current_trace, enable_trace
 from lazyllm.tracing.collect import runtime as tracing_runtime
 from fastapi.responses import StreamingResponse
 from chat.app.core.trace_sink import ensure_local_trace_sink, local_trace_enabled
+from chat.components.lclm.detector import normalize_lclm_mode, should_use_lclm
 from chat.config import (RAG_MODE, MULTIMODAL_MODE, MAX_CONCURRENCY,
                          LAZYRAG_LLM_PRIORITY, SENSITIVE_FILTER_RESPONSE_TEXT,
                          URL_MAP, resolve_dataset_url)
@@ -151,6 +152,33 @@ def _sse_line(payload: Dict[str, Any]) -> str:
 
 def _resp(code: int, msg: str, data: Any, cost: float) -> Dict[str, Any]:
     return {'code': code, 'msg': msg, 'data': data, 'cost': cost}
+
+
+def merge_lclm_runtime_params(
+    query_params: Optional[Dict[str, Any]],
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    runtime_params = dict(query_params or {})
+    runtime_params.update(kwargs or {})
+    filters = runtime_params.get('filters')
+    if isinstance(filters, dict):
+        for key, value in filters.items():
+            if isinstance(key, str) and key.startswith('lclm_'):
+                runtime_params[key] = value
+    return runtime_params
+
+
+def _log_lclm_route(
+    *,
+    mode: str,
+    use_lclm: bool,
+    reason: str,
+    available_skills: Any,
+) -> None:
+    LOG.info(
+        '[ChatServer] [LCLM_ROUTE] '
+        f'mode={mode} use={use_lclm} reason={reason} available_skills={available_skills}'
+    )
 
 
 def _friendly_chat_error(exc: Exception) -> Optional[str]:
@@ -328,6 +356,31 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
         available_tools, available_skills, memory, user_preference,
         use_memory, create_user_id,
     )
+    runtime_params = merge_lclm_runtime_params(
+        query_params,
+        {
+            'query': query,
+            'history': query_params.get('history') or [],
+            'dataset': dataset,
+            'available_skills': available_skills,
+            'available_tools': available_tools,
+            'session_id': session_id,
+            'reasoning': bool(reasoning),
+            'stream': bool(is_stream),
+        },
+    )
+    lclm_mode = normalize_lclm_mode(runtime_params.get('lclm_mode'))
+    use_lclm, lclm_reason = should_use_lclm(query, runtime_params)
+    runtime_params['lclm_decision'] = lclm_reason
+    _log_lclm_route(
+        mode=lclm_mode,
+        use_lclm=use_lclm,
+        reason=lclm_reason,
+        available_skills=runtime_params.get('available_skills'),
+    )
+    effective_reasoning = bool(reasoning) or bool(use_lclm)
+    if use_lclm:
+        LOG.info('[ChatServer] [LCLM_ROUTE] calling run_outline_longform')
 
     def _init_session():
         lazyllm.globals._init_sid(sid=session_id)
@@ -341,17 +394,24 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
         try:
             async with _get_rag_semaphore():
                 _init_session()
-                ppl_call = _build_ppl_call(bool(reasoning), dataset, query_params, stream=False)
+                ppl_call = _build_ppl_call(effective_reasoning, dataset, runtime_params, stream=False)
                 result, trace_id, local_trace = await asyncio.to_thread(
                     _run_ppl_with_trace_in_thread,
                     ppl_call[0],
                     ppl_call[1:],
                     session_id,
                     dataset,
-                    'sync_reasoning' if reasoning else 'sync',
+                    'sync_reasoning' if effective_reasoning else 'sync',
                     bool(trace),
                 )
                 cost = round(time.time() - start_time, 3)
+                if use_lclm and isinstance(result, dict):
+                    LOG.info(
+                        '[ChatServer] [LCLM_ROUTE] '
+                        f'result keys={list(result.keys())} '
+                        f'download_link={result.get("download_link")} '
+                        f'download_url={result.get("download_url")}'
+                    )
                 data = _attach_trace_info(result, trace_id, local_trace)
                 return _resp(200, 'success', data, cost)
         except Exception as exc:
@@ -386,7 +446,7 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
 
         first_frame_logged = False
         collected_chunks: List[str] = []
-        ppl_call = _build_ppl_call(bool(reasoning), dataset, query_params, stream=True)
+        ppl_call = _build_ppl_call(effective_reasoning, dataset, runtime_params, stream=True)
 
         async def event_stream(ppl, *args) -> Any:
             nonlocal first_frame_logged
@@ -400,7 +460,7 @@ async def handle_chat(query: str, history: Optional[List[Dict[str, Any]]],
                         args,
                         session_id,
                         dataset,
-                        'stream_reasoning' if reasoning else 'stream',
+                        'stream_reasoning' if effective_reasoning else 'stream',
                         bool(trace),
                     )
                     if trace_id is not None:

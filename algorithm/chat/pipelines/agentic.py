@@ -10,7 +10,7 @@ import threading
 from functools import lru_cache
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import lazyllm
 from lazyllm import loop, once_wrapper
@@ -30,7 +30,7 @@ from chat.components.agentic.config import (  # noqa: E402
     _normalize_available_tools,
     _sync_request_context,
 )
-from chat.components.lclm.detector import should_use_lclm  # noqa: E402
+from chat.components.lclm.detector import normalize_lclm_mode, should_use_lclm  # noqa: E402
 from chat.components.agentic.history import (  # noqa: E402
     _build_stream_citation_scanner,
     _count_tool_turns,
@@ -423,6 +423,52 @@ def _ensure_tools_registered() -> None:
     from chat.tools import kb, memory, pptx, html_deck, skill_manager, web_search  # noqa: F401
 
 
+def _log_lclm_exception(message: str, exc: Exception) -> None:
+    logger = getattr(lazyllm, 'LOG', None)
+    fn = getattr(logger, 'exception', None) or getattr(logger, 'error', None) or getattr(logger, 'info', None)
+    if callable(fn):
+        fn(f'{message}: {exc}')
+
+
+def merge_lclm_runtime_params(
+    query_params: Optional[Dict[str, Any]],
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> dict[str, Any]:
+    runtime_params: dict[str, Any] = {}
+    if isinstance(query_params, dict):
+        runtime_params.update(query_params)
+    if isinstance(kwargs, dict):
+        runtime_params.update(kwargs)
+
+    filters = runtime_params.get('filters')
+    if isinstance(filters, dict):
+        for key, value in filters.items():
+            if isinstance(key, str) and key.startswith('lclm_'):
+                runtime_params[key] = value
+    return runtime_params
+
+
+def _log_lclm_runtime_params(runtime_params: Mapping[str, Any]) -> None:
+    logger = getattr(lazyllm, 'LOG', None)
+    fn = getattr(logger, 'info', None)
+    if not callable(fn):
+        return
+    for key in (
+        'lclm_mode',
+        'lclm_use_llm',
+        'lclm_max_outline_nodes',
+        'lclm_max_depth',
+        'lclm_node_evidence_topk',
+        'lclm_enable_evidence',
+        'lclm_enable_arxiv',
+        'lclm_enable_web',
+        'lclm_max_repair_rounds',
+        'lclm_save_artifact',
+    ):
+        if key in runtime_params:
+            fn(f'[LCLM] runtime {key}={runtime_params.get(key)}')
+
+
 @lru_cache(maxsize=1)
 def _get_cwd() -> str:
     return str(Path.cwd())
@@ -437,6 +483,7 @@ def _run_lclm_pipeline(
     query: str,
     history: list[dict[str, Any]],
     runtime_params: dict[str, Any],
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     from chat.components.lclm.pipeline import run_outline_longform
 
@@ -444,8 +491,48 @@ def _run_lclm_pipeline(
         query=query,
         history=history,
         runtime_params=runtime_params,
+        progress_callback=progress_callback,
     )
     return result if isinstance(result, dict) else {'text': str(result or '')}
+
+
+def _lclm_progress_text(event: Mapping[str, Any], elapsed_sec: float) -> str:
+    text = str(event.get('text') or '').strip()
+    if text:
+        return text
+    stage = str(event.get('stage') or '').strip().lower()
+    if stage == 'planning_start':
+        return '正在规划大纲...'
+    if stage == 'planning_end':
+        nodes = event.get('outline_nodes')
+        if isinstance(nodes, int) and nodes > 0:
+            return f'已完成大纲规划，共 {nodes} 个章节。'
+        return '已完成大纲规划。'
+    if stage == 'evidence_start':
+        return '正在检索章节证据...'
+    if stage == 'evidence_end':
+        return '章节证据检索完成。'
+    if stage == 'writer_start':
+        return '正在撰写章节内容...'
+    if stage == 'writer_end':
+        return '章节撰写完成。'
+    if stage == 'compose_start':
+        return '正在合成全文...'
+    if stage == 'compose_end':
+        return '全文合成完成。'
+    if stage == 'artifact_saving':
+        return '正在保存可下载文件...'
+    if stage == 'artifact_saved':
+        return '文件已生成，正在返回下载链接...'
+    if stage == 'done':
+        return '长文本生成完成。'
+    elapsed = int(max(0.0, elapsed_sec))
+    return f'正在生成长文本，请稍候...（已耗时约 {elapsed} 秒）'
+
+
+def _safe_text_chunk(text: Any, fallback: str) -> str:
+    chunk = str(text or '').strip()
+    return chunk if chunk else fallback
 
 
 async def _lclm_forward_stream(
@@ -456,34 +543,124 @@ async def _lclm_forward_stream(
     global_sid: str,
     local_sid: str,
 ):
-    chunk_size = int(runtime_params.get('stream_chunk_size') or _STREAM_CHUNK_SIZE)
+    lclm_mode = normalize_lclm_mode(runtime_params.get('lclm_mode'))
+    heartbeat_raw = runtime_params.get('lclm_stream_heartbeat_sec')
     try:
-        lazyllm.globals._init_sid(global_sid)
-        lazyllm.locals._init_sid(local_sid)
-        lazyllm.globals['agentic_config'] = runtime_params
-        result = await asyncio.to_thread(
+        heartbeat_sec = int(heartbeat_raw)
+    except Exception:
+        heartbeat_sec = 15
+    heartbeat_sec = max(5, min(30, heartbeat_sec))
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    start_ts = loop.time()
+
+    def _publish_event(payload: dict[str, Any]) -> None:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, payload)
+        except Exception:
+            return
+
+    def _progress_callback(event: dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        _publish_event({'type': 'progress', 'payload': dict(event)})
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(
             _run_lclm_pipeline,
             query=query,
             history=history,
             runtime_params=runtime_params,
+            progress_callback=_progress_callback,
         )
-        output = _format_non_stream_result(result, runtime_params)
-        think = str(output.get('think') or '')
-        text = str(output.get('text') or '')
-        for chunk in _iter_text_chunks(think, chunk_size):
-            yield _stream_frame(think=chunk)
-        for chunk in _iter_text_chunks(text, chunk_size):
-            yield _stream_frame(text=chunk)
-        sources = output.get('sources') or []
-        if sources:
-            yield _stream_frame(text='', sources=sources)
-        extra = {}
-        for key in ('artifact', 'download_link', 'download_url'):
-            if output.get(key):
+    )
+    try:
+        lazyllm.globals._init_sid(global_sid)
+        lazyllm.locals._init_sid(local_sid)
+        lazyllm.globals['agentic_config'] = runtime_params
+        yield _stream_frame(
+            think='LCLM workflow started',
+            text='正在启动长文本生成流程...',
+            extra={'finish_reason': 'FINISH_REASON_UNSPECIFIED'},
+        )
+
+        final_result: Optional[dict[str, Any]] = None
+        while True:
+            if worker.done():
+                result = await worker
+                if isinstance(result, dict):
+                    final_result = result
+                else:
+                    final_result = {'text': str(result or '')}
+                break
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=heartbeat_sec)
+            except asyncio.TimeoutError:
+                elapsed = loop.time() - start_ts
+                yield _stream_frame(
+                    think='LCLM workflow in progress',
+                    text=f'正在生成长文本，请稍候...（已耗时约 {int(elapsed)} 秒）',
+                    extra={'finish_reason': 'FINISH_REASON_UNSPECIFIED'},
+                )
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get('type') != 'progress':
+                continue
+            event = item.get('payload')
+            if not isinstance(event, dict):
+                continue
+            elapsed = loop.time() - start_ts
+            progress_text = _lclm_progress_text(event, elapsed)
+            yield _stream_frame(
+                think='LCLM workflow in progress',
+                text=_safe_text_chunk(progress_text, '正在生成长文本，请稍候...'),
+                extra={
+                    'lclm_progress': event,
+                    'finish_reason': 'FINISH_REASON_UNSPECIFIED',
+                },
+            )
+
+        output = _format_non_stream_result(final_result or {}, runtime_params)
+        final_think = str(output.get('think') or 'LCLM workflow completed').strip() or 'LCLM workflow completed'
+        final_text = str(output.get('text') or '').strip()
+        final_sources = output.get('sources') or []
+
+        extra: dict[str, Any] = {}
+        for key in ('artifact', 'download_link', 'download_url', 'lclm', 'preview_url'):
+            if key in output and output.get(key) is not None:
                 extra[key] = output.get(key)
-        if extra:
-            yield _stream_frame(text='', extra=extra)
-    except Exception:
+
+        if not final_text:
+            title = ''
+            lclm_meta = output.get('lclm')
+            if isinstance(lclm_meta, dict):
+                title = str(lclm_meta.get('title') or '').strip()
+            download_link = str(output.get('download_link') or output.get('download_url') or '').strip()
+            lines = ['已生成长文本报告。']
+            if title:
+                lines.append(f'标题：{title}')
+            if download_link:
+                lines.append(f'下载：[点击下载]({download_link})')
+            lines.append('下面是正文预览：')
+            lines.append('请通过下载链接查看完整内容。')
+            final_text = '\n'.join(lines)
+
+        final_text = _safe_text_chunk(final_text, '已生成长文本结果，请查看下载链接。')
+        yield _stream_frame(
+            think=final_think,
+            text=final_text,
+            sources=final_sources,
+            extra={
+                **extra,
+                'finish_reason': 'FINISH_REASON_STOP',
+            },
+        )
+    except Exception as exc:
+        _log_lclm_exception('[LCLM] stream pipeline failed', exc)
+        if lclm_mode == 'force':
+            raise
         async for frame in _agentic_forward_stream(
             query=query,
             history=history,
@@ -492,6 +669,9 @@ async def _lclm_forward_stream(
             local_sid=local_sid,
         ):
             yield frame
+    finally:
+        if not worker.done():
+            worker.cancel()
 
 
 def agentic_rag(
@@ -506,14 +686,14 @@ def agentic_rag(
     if not isinstance(query, str) or not query.strip():
         raise ValueError('query is required')
 
-    runtime_params = _get_runtime_agent_defaults()
-    runtime_params.update(global_params or {})
-    runtime_params.update(kwargs)
+    runtime_params = merge_lclm_runtime_params(_get_runtime_agent_defaults(), global_params or {})
+    runtime_params = merge_lclm_runtime_params(runtime_params, kwargs)
     # stream can be passed either as a function arg or inside global_params dict
     stream = stream or bool(runtime_params.get('stream', False))
     runtime_params['stream'] = stream
     _sync_request_context(runtime_params)
     _reset_citation_state(runtime_params)
+    _log_lclm_runtime_params(runtime_params)
 
     history = (global_params or {}).get('history') or []
     if not isinstance(history, list):
@@ -525,6 +705,7 @@ def agentic_rag(
     use_lclm, lclm_reason = should_use_lclm(query, runtime_params)
     runtime_params['lclm_decision'] = lclm_reason
     if use_lclm:
+        lclm_mode = normalize_lclm_mode(runtime_params.get('lclm_mode'))
         if not stream:
             try:
                 lclm_result = _run_lclm_pipeline(
@@ -533,7 +714,10 @@ def agentic_rag(
                     runtime_params=runtime_params,
                 )
                 return _format_non_stream_result(lclm_result, runtime_params)
-            except Exception:
+            except Exception as exc:
+                _log_lclm_exception('[LCLM] non-stream pipeline failed', exc)
+                if lclm_mode == 'force':
+                    raise
                 result = agentic_forward(query=query.strip(), history=history)
                 return _format_non_stream_result(result, runtime_params)
         return _lclm_forward_stream(

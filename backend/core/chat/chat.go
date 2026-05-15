@@ -40,7 +40,8 @@ type LazyChatRequest struct {
 	History         []ChatMessage   `json:"history,omitempty"`
 	SessionID       string          `json:"session_id"`
 	Files           []string        `json:"files,omitempty"`
-	Filters         *DatasetFilters `json:"filters"`
+	Filters         *DatasetFilters `json:"-"`
+	FilterPayload   map[string]any  `json:"filters,omitempty"`
 	Reasoning       bool            `json:"reasoning"`
 	Databases       []any           `json:"databases,omitempty"`
 	EnableThinking  bool            `json:"enable_thinking,omitempty"`
@@ -227,6 +228,7 @@ func buildLazyChatRequest(body map[string]any) *LazyChatRequest {
 	}
 	req.History = chatMessagesFromAny(body["history"])
 	req.Filters = datasetFiltersFromAny(body["filters"])
+	req.FilterPayload = filterPayloadFromAny(body["filters"])
 	req.Files = stringSlice(body["files"])
 	if reasoning, ok := body["reasoning"].(bool); ok {
 		req.Reasoning = reasoning
@@ -279,6 +281,14 @@ func chatMessagesFromAny(v any) []ChatMessage {
 		return nil
 	}
 	return messages
+}
+
+func filterPayloadFromAny(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 func datasetFiltersFromAny(v any) *DatasetFilters {

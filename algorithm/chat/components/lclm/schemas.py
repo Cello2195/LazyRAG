@@ -109,6 +109,7 @@ def parse_json_text(
 @dataclass
 class LongFormTaskSchema:
     query: str
+    original_query: str = ''
     language: str = 'zh'
     genre: str = 'generic_longform'
     audience: str = 'general'
@@ -130,8 +131,10 @@ class LongFormTaskSchema:
             normalized_query = str(query or '').strip()
         if not normalized_query:
             normalized_query = '长文本任务'
+        original_query = str(data.get('original_query') or query or normalized_query).strip() or normalized_query
         return cls(
             query=normalized_query,
+            original_query=original_query,
             language=str(data.get('language') or 'zh').strip().lower() or 'zh',
             genre=str(data.get('genre') or 'generic_longform').strip().lower() or 'generic_longform',
             audience=str(data.get('audience') or 'general').strip().lower() or 'general',
@@ -284,6 +287,8 @@ def coerce_task_schema(payload: Any, *, query: str, default_mode: str = 'auto') 
                 break
     if 'query' not in parsed:
         parsed['query'] = query
+    if 'original_query' not in parsed:
+        parsed['original_query'] = query
     if 'lclm_mode' not in parsed:
         parsed['lclm_mode'] = default_mode
     return LongFormTaskSchema.from_dict(parsed, query=query)

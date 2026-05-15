@@ -11,6 +11,11 @@ from chat.components.lclm.schemas import (
     coerce_task_schema,
     parse_json_text,
 )
+from chat.components.lclm.text_sanitize import (
+    is_bad_placeholder_text,
+    sanitize_lclm_text,
+    sanitize_title,
+)
 from chat.prompts.lclm import OUTLINE_PLANNER_PROMPT, TASK_SCHEMA_PROMPT
 
 
@@ -101,8 +106,10 @@ def _guess_source_policy(query: str, runtime_params: Mapping[str, Any]) -> str:
 
 def _fallback_task_schema(query: str, runtime_params: Mapping[str, Any]) -> LongFormTaskSchema:
     mode = str(runtime_params.get('lclm_mode') or 'auto').strip().lower() or 'auto'
+    original_query = str(runtime_params.get('original_query') or query or '').strip()
     return LongFormTaskSchema(
-        query=str(query or '').strip(),
+        query=original_query or str(query or '').strip(),
+        original_query=original_query or str(query or '').strip(),
         language=_guess_language(query),
         genre=_guess_genre(query),
         audience=_guess_audience(query),
@@ -158,7 +165,11 @@ def _fallback_outline(
     section_words: int,
 ) -> tuple[str, List[OutlineNode]]:
     nodes: list[OutlineNode] = []
-    outline_title = f'{task.query} - 长文报告'
+    outline_title = sanitize_title(
+        f'{task.original_query or task.query} - 长文报告',
+        task.original_query or task.query,
+        fallback='长文报告',
+    )
     template = _rule_outline_template(task)[:max_nodes]
     parent_by_level: dict[int, str] = {}
     for idx, (level, title, goal) in enumerate(template, start=1):
@@ -184,7 +195,7 @@ def _fallback_outline(
                     f'{title} 的典型案例或对比信息',
                 ],
                 retrieval_queries=[
-                    f'{task.query} {title} 关键要点',
+                    f'{task.original_query or task.query} {title} 关键要点',
                     f'{title} 风险 限制 实践',
                 ],
                 hard_controls={
@@ -226,18 +237,33 @@ class LCLMPlanner:
             return None
         return str(out)
 
+    @staticmethod
+    def _is_invalid_schema_output(task: LongFormTaskSchema, original_query: str) -> bool:
+        if is_bad_placeholder_text(task.query):
+            return True
+        if '<query>' in task.query.lower():
+            return True
+        oq = str(original_query or '').strip()
+        return bool(oq) and len(task.query.strip()) <= 2
+
     def build_task_schema(
         self,
         query: str,
         runtime_params: Mapping[str, Any],
     ) -> LongFormTaskSchema:
-        fallback = _fallback_task_schema(query, runtime_params)
+        original_query = str(runtime_params.get('original_query') or query or '').strip()
+        fallback = _fallback_task_schema(original_query or query, runtime_params)
         prompt = _fill_prompt(TASK_SCHEMA_PROMPT, query=query)
         llm_output = self._call_llm(prompt)
         if not llm_output:
             return fallback
-        parsed = coerce_task_schema(llm_output, query=query, default_mode=fallback.lclm_mode)
-        if not parsed.query:
+        parsed = coerce_task_schema(
+            sanitize_lclm_text(llm_output),
+            query=original_query or query,
+            default_mode=fallback.lclm_mode,
+        )
+        parsed.original_query = original_query or parsed.original_query or parsed.query
+        if self._is_invalid_schema_output(parsed, original_query):
             return fallback
         # Keep fallback defaults when LLM misses key fields.
         if parsed.genre == 'generic_longform' and fallback.genre != 'generic_longform':
@@ -246,6 +272,8 @@ class LCLMPlanner:
             parsed.source_policy = fallback.source_policy
         if parsed.output_format == 'markdown' and fallback.output_format != 'markdown':
             parsed.output_format = fallback.output_format
+        parsed.query = sanitize_title(parsed.query, original_query or parsed.query, fallback='长文本任务')
+        parsed.original_query = original_query or parsed.original_query or parsed.query
         return parsed
 
     def build_outline(
@@ -253,7 +281,7 @@ class LCLMPlanner:
         task: LongFormTaskSchema,
         runtime_params: Mapping[str, Any],
     ) -> tuple[str, List[OutlineNode], List[str]]:
-        max_nodes = _clamp(_runtime_int(runtime_params, 'lclm_max_outline_nodes', 8), 3, 16)
+        max_nodes = _clamp(_runtime_int(runtime_params, 'lclm_max_outline_nodes', 8), 1, 16)
         max_depth = _clamp(_runtime_int(runtime_params, 'lclm_max_depth', 3), 1, 4)
         min_words = _clamp(_runtime_int(runtime_params, 'lclm_section_min_words', 180), 80, 1200)
         max_words = _clamp(_runtime_int(runtime_params, 'lclm_section_max_words', 900), 120, 2400)
@@ -280,9 +308,9 @@ class LCLMPlanner:
             warnings.append('outline_planner_empty_output_fallback')
             return fallback_title, fallback_nodes, warnings
 
-        parsed = parse_json_text(primary, default=None)
+        parsed = parse_json_text(sanitize_lclm_text(primary), default=None)
         nodes = coerce_outline_nodes(
-            parsed if parsed is not None else primary,
+            parsed if parsed is not None else sanitize_lclm_text(primary),
             max_nodes=max_nodes,
             max_depth=max_depth,
             default_words=section_words,
@@ -291,7 +319,17 @@ class LCLMPlanner:
             title = ''
             if isinstance(parsed, dict):
                 title = str(parsed.get('title') or '').strip()
-            return (title or fallback_title), nodes, warnings
+            title = sanitize_title(title or fallback_title, task.original_query or task.query, fallback='长文报告')
+            for idx, node in enumerate(nodes, start=1):
+                if is_bad_placeholder_text(node.title):
+                    node.title = f'章节 {idx}'
+                if is_bad_placeholder_text(node.goal):
+                    node.goal = f'围绕 {task.original_query or task.query} 进行分析。'
+                node.evidence_needs = [x for x in node.evidence_needs if not is_bad_placeholder_text(x)]
+                node.retrieval_queries = [x for x in node.retrieval_queries if not is_bad_placeholder_text(x)]
+                if not node.retrieval_queries:
+                    node.retrieval_queries = [f'{task.original_query or task.query} {node.title}']
+            return title, nodes, warnings
 
         # One repair round for broken JSON output.
         repair_prompt = (
@@ -300,18 +338,32 @@ class LCLMPlanner:
         )
         repaired = self._call_llm(repair_prompt)
         repaired_nodes = coerce_outline_nodes(
-            repaired,
+            sanitize_lclm_text(repaired),
             max_nodes=max_nodes,
             max_depth=max_depth,
             default_words=section_words,
         )
         if repaired_nodes:
-            repaired_parsed = parse_json_text(repaired, default={})
+            repaired_parsed = parse_json_text(sanitize_lclm_text(repaired), default={})
             repaired_title = ''
             if isinstance(repaired_parsed, dict):
                 repaired_title = str(repaired_parsed.get('title') or '').strip()
             warnings.append('outline_planner_repaired_json')
-            return (repaired_title or fallback_title), repaired_nodes, warnings
+            repaired_title = sanitize_title(
+                repaired_title or fallback_title,
+                task.original_query or task.query,
+                fallback='长文报告',
+            )
+            for idx, node in enumerate(repaired_nodes, start=1):
+                if is_bad_placeholder_text(node.title):
+                    node.title = f'章节 {idx}'
+                if is_bad_placeholder_text(node.goal):
+                    node.goal = f'围绕 {task.original_query or task.query} 进行分析。'
+                node.evidence_needs = [x for x in node.evidence_needs if not is_bad_placeholder_text(x)]
+                node.retrieval_queries = [x for x in node.retrieval_queries if not is_bad_placeholder_text(x)]
+                if not node.retrieval_queries:
+                    node.retrieval_queries = [f'{task.original_query or task.query} {node.title}']
+            return repaired_title, repaired_nodes, warnings
 
         warnings.append('outline_planner_parse_failed_rule_fallback')
         return fallback_title, fallback_nodes, warnings

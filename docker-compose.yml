@@ -620,6 +620,7 @@ services:
       LAZYRAG_SKILL_REVIEW_DEBUG: ${LAZYRAG_SKILL_REVIEW_DEBUG:-false}
       LAZYRAG_CORE_SERVICE_URL: ${LAZYRAG_CORE_SERVICE_URL:-http://core:8000}
       LAZYRAG_WORD_GROUP_APPLY_URL: ${LAZYRAG_WORD_GROUP_APPLY_URL:-}
+      LAZYRAG_LCLM_MODE: ${LAZYRAG_LCLM_MODE:-auto}
       <<: [*trace-config, *proxy-env, *db-conn, *core-db-conn, *llm-api-keys, *upload-paths]
     command: ["python", "-m", "chat.app.chat", "--port", "8046"]
     depends_on:

@@ -4,6 +4,7 @@ import json
 import re
 from collections import OrderedDict
 from html import escape
+from urllib.parse import urlparse
 from typing import Any, Optional
 
 from chat.utils.stream_scanner import BasePlugin, IncrementalScanner
@@ -22,6 +23,13 @@ _CITATION_PATTERN = re.compile(r'\[\[(\d+)\]\]')
 _SOURCE_LINK_PATTERN = re.compile(r'\[(\d+)\]\(#source(?:\s+"[^"]*")?\)')
 _SOURCE_REF_PATTERN = re.compile(r'\[\[(\d+)\]\]')
 _THINK_BLOCK_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
+_MARKDOWN_LINK_PATTERN = re.compile(r'\[([^\]]+)\]\(([^)\s]+)\)')
+_STATIC_ARTIFACT_PATH_RE = re.compile(r'(/api/chat/artifacts/static-files/[^\s\)]+)')
+_LABEL_URL_LINE_PATTERN = re.compile(r'(?im)^\s*(下载|download|预览|preview)\s*[：:]\s*(\S+)\s*$')
+_STATIC_URL_PATTERN = re.compile(
+    r'https?://[^\s]+/api/chat/artifacts/static-files/[^\s]+'
+    r'|/api/chat/artifacts/static-files/[^\s]+'
+)
 _HISTORY_TAG_PATTERN = re.compile(
     r'<(?P<tag>tp|trp|tool_call|tool_result)(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>',
     re.DOTALL,
@@ -388,6 +396,115 @@ def _split_think_and_body(raw_text: str, existing_think: Any = '') -> tuple[str,
     return think.strip(), body
 
 
+def _normalize_artifact_link(url: str) -> str:
+    raw = str(url or '').strip()
+    if not raw:
+        return ''
+    if raw.startswith('/api/chat/artifacts/static-files/'):
+        return raw
+    parsed = urlparse(raw)
+    if parsed.path.startswith('/api/chat/artifacts/static-files/'):
+        out = parsed.path
+        if parsed.query:
+            out = f'{out}?{parsed.query}'
+        return out
+    match = _STATIC_ARTIFACT_PATH_RE.search(raw)
+    if match:
+        return match.group(1)
+    return raw
+
+
+def _is_download_candidate(label: str, url: str) -> bool:
+    low_label = label.lower()
+    low_url = url.lower()
+    if any(token in low_label for token in ('下载', 'download')):
+        return True
+    if 'download=1' in low_url:
+        return True
+    return low_url.endswith('.pptx') or '.pptx?' in low_url
+
+
+def _is_preview_candidate(label: str, url: str) -> bool:
+    low_label = label.lower()
+    low_url = url.lower()
+    if any(token in low_label for token in ('预览', 'preview')):
+        return True
+    return low_url.endswith('.html') or '.html?' in low_url
+
+
+def _extract_artifact_links_from_text(text: str) -> dict[str, str]:
+    links: dict[str, str] = {}
+    raw = str(text or '')
+    for match in _MARKDOWN_LINK_PATTERN.finditer(raw):
+        label = str(match.group(1) or '').strip()
+        url = _normalize_artifact_link(str(match.group(2) or '').strip())
+        if not url:
+            continue
+        if _is_download_candidate(label, url):
+            links.setdefault('download_link', url)
+            links.setdefault('download_url', url)
+        elif _is_preview_candidate(label, url):
+            links.setdefault('preview_url', url)
+
+    for match in _LABEL_URL_LINE_PATTERN.finditer(raw):
+        label = str(match.group(1) or '').strip()
+        url = _normalize_artifact_link(str(match.group(2) or '').strip())
+        if not url:
+            continue
+        if _is_download_candidate(label, url):
+            links.setdefault('download_link', url)
+            links.setdefault('download_url', url)
+        elif _is_preview_candidate(label, url):
+            links.setdefault('preview_url', url)
+
+    if not links.get('download_link'):
+        for candidate in _STATIC_URL_PATTERN.findall(raw):
+            url = _normalize_artifact_link(candidate)
+            low = url.lower()
+            if '.pptx' in low or 'download=1' in low:
+                links.setdefault('download_link', url)
+                links.setdefault('download_url', url)
+                break
+    if not links.get('preview_url'):
+        for candidate in _STATIC_URL_PATTERN.findall(raw):
+            url = _normalize_artifact_link(candidate)
+            low = url.lower()
+            if '.html' in low or '.htm' in low:
+                links.setdefault('preview_url', url)
+                break
+    return links
+
+
+def _merge_structured_artifact_fields(output: dict[str, Any], text: str) -> None:
+    artifact = output.get('artifact')
+    if not isinstance(artifact, dict):
+        artifact = {}
+    else:
+        artifact = dict(artifact)
+
+    extracted = _extract_artifact_links_from_text(text)
+    existing_download_link = str(output.get('download_link') or artifact.get('download_link') or '').strip()
+    existing_download_url = str(output.get('download_url') or artifact.get('download_url') or '').strip()
+    existing_preview_url = str(output.get('preview_url') or artifact.get('preview_url') or '').strip()
+
+    download_link = _normalize_artifact_link(existing_download_link or extracted.get('download_link', ''))
+    download_url = _normalize_artifact_link(existing_download_url or extracted.get('download_url', ''))
+    preview_url = _normalize_artifact_link(existing_preview_url or extracted.get('preview_url', ''))
+
+    if download_link:
+        output['download_link'] = download_link
+        artifact.setdefault('download_link', download_link)
+    if download_url:
+        output['download_url'] = download_url
+        artifact.setdefault('download_url', download_url)
+    if preview_url:
+        output['preview_url'] = preview_url
+        artifact.setdefault('preview_url', preview_url)
+
+    if artifact:
+        output['artifact'] = artifact
+
+
 def _format_non_stream_result(result: Any, config: dict) -> dict[str, Any]:
     if isinstance(result, dict):
         raw_text = str(result.get('text') or result.get('message') or '')
@@ -405,6 +522,7 @@ def _format_non_stream_result(result: Any, config: dict) -> dict[str, Any]:
         'text': text.strip(),
         'sources': sources,
     })
+    _merge_structured_artifact_fields(output, text)
     return output
 
 

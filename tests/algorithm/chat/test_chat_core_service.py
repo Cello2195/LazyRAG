@@ -152,6 +152,171 @@ def test_build_query_params_filters_history_and_modes(monkeypatch):
     assert params['session_id'] == 'sid-1'
     assert 'document_url' in params
 
+
+def test_merge_lclm_runtime_params_promotes_lclm_filters(monkeypatch):
+    module = _import_chat_service_module(monkeypatch)
+
+    merged = module.merge_lclm_runtime_params(
+        {
+            'query': 'q',
+            'filters': {
+                'scope': 'all',
+                'lclm_mode': 'force',
+                'lclm_enable_evidence': False,
+            },
+        },
+        {'stream': False},
+    )
+
+    assert merged['lclm_mode'] == 'force'
+    assert merged['lclm_enable_evidence'] is False
+    assert merged['filters']['scope'] == 'all'
+    assert merged['stream'] is False
+
+
+def test_handle_chat_force_lclm_routes_to_reasoning_pipeline(monkeypatch):
+    captured = {}
+    chat_server = SimpleNamespace(
+        sensitive_filter=SimpleNamespace(loaded=False, check=lambda query: (False, None)),
+        has_dataset=lambda dataset: dataset == 'algo',
+        get_query_pipeline=lambda dataset, stream=False: 'naive-pipeline',
+        query_ppl_reasoning='reasoning-pipeline',
+    )
+    module = _import_chat_service_module(monkeypatch, chat_server=chat_server)
+
+    def fake_run_ppl_with_trace(ppl, ppl_args, *, session_id, dataset, mode_tag, trace_enabled):
+        captured['ppl'] = ppl
+        captured['ppl_args'] = ppl_args
+        captured['mode_tag'] = mode_tag
+        del session_id, dataset, trace_enabled
+        return {'text': 'lclm answer'}, None, None
+
+    monkeypatch.setattr(module, '_run_ppl_with_trace', fake_run_ppl_with_trace)
+
+    result = asyncio.run(
+        module.handle_chat(
+            query='请详细调研一下',
+            history=[],
+            session_id='sid-1',
+            filters={'lclm_mode': 'force', 'lclm_max_outline_nodes': 1},
+            files=[],
+            debug=False,
+            reasoning=False,
+            databases=[],
+            dataset='algo',
+            priority=None,
+            is_stream=False,
+        )
+    )
+
+    assert result['code'] == 200
+    assert captured['ppl'] == 'reasoning-pipeline'
+    assert captured['mode_tag'] == 'sync_reasoning'
+    runtime_params = captured['ppl_args'][0]
+    assert runtime_params['lclm_mode'] == 'force'
+    assert runtime_params['lclm_max_outline_nodes'] == 1
+    assert runtime_params['filters']['lclm_mode'] == 'force'
+
+
+def test_handle_chat_auto_longform_routes_to_reasoning_pipeline(monkeypatch):
+    captured = {}
+    chat_server = SimpleNamespace(
+        sensitive_filter=SimpleNamespace(loaded=False, check=lambda query: (False, None)),
+        has_dataset=lambda dataset: dataset == 'algo',
+        get_query_pipeline=lambda dataset, stream=False: 'naive-pipeline',
+        query_ppl_reasoning='reasoning-pipeline',
+    )
+    module = _import_chat_service_module(monkeypatch, chat_server=chat_server)
+
+    def fake_run_ppl_with_trace(ppl, ppl_args, *, session_id, dataset, mode_tag, trace_enabled):
+        captured['ppl'] = ppl
+        captured['ppl_args'] = ppl_args
+        captured['mode_tag'] = mode_tag
+        del session_id, dataset, trace_enabled
+        return {'text': 'lclm answer', 'lclm': {'enabled': True, 'outline_nodes': 1}}, None, None
+
+    monkeypatch.setattr(module, '_run_ppl_with_trace', fake_run_ppl_with_trace)
+
+    result = asyncio.run(
+        module.handle_chat(
+            query='请写一份关于 LazyRAG 长文本生成技术路线的中文调研报告，包含层级大纲、方法分类、工程实现建议，并提供可下载文件。',
+            history=[],
+            session_id='sid-1',
+            filters={
+                'lclm_mode': 'auto',
+                'lclm_use_llm': False,
+                'lclm_max_outline_nodes': 1,
+                'lclm_node_evidence_topk': 0,
+                'lclm_enable_evidence': False,
+                'lclm_enable_arxiv': False,
+                'lclm_enable_web': False,
+                'lclm_save_artifact': True,
+            },
+            files=[],
+            debug=False,
+            reasoning=False,
+            databases=[],
+            dataset='algo',
+            priority=None,
+            available_skills=['outline-longform-generation'],
+            is_stream=False,
+        )
+    )
+
+    assert result['code'] == 200
+    assert captured['ppl'] == 'reasoning-pipeline'
+    assert captured['mode_tag'] == 'sync_reasoning'
+    runtime_params = captured['ppl_args'][0]
+    assert runtime_params['lclm_mode'] == 'auto'
+    assert runtime_params['available_skills'] == ['outline-longform-generation']
+    assert runtime_params['lclm_max_outline_nodes'] == 1
+    assert runtime_params['lclm_enable_evidence'] is False
+    assert runtime_params['reasoning'] is False
+    assert runtime_params['stream'] is False
+
+
+def test_handle_chat_auto_short_question_stays_in_kb_chat(monkeypatch):
+    captured = {}
+    chat_server = SimpleNamespace(
+        sensitive_filter=SimpleNamespace(loaded=False, check=lambda query: (False, None)),
+        has_dataset=lambda dataset: dataset == 'algo',
+        get_query_pipeline=lambda dataset, stream=False: 'naive-pipeline',
+        query_ppl_reasoning='reasoning-pipeline',
+    )
+    module = _import_chat_service_module(monkeypatch, chat_server=chat_server)
+
+    def fake_run_ppl_with_trace(ppl, ppl_args, *, session_id, dataset, mode_tag, trace_enabled):
+        captured['ppl'] = ppl
+        captured['ppl_args'] = ppl_args
+        captured['mode_tag'] = mode_tag
+        del session_id, dataset, trace_enabled
+        return {'text': 'short answer'}, None, None
+
+    monkeypatch.setattr(module, '_run_ppl_with_trace', fake_run_ppl_with_trace)
+
+    result = asyncio.run(
+        module.handle_chat(
+            query='VBFN 是什么？请用三句话回答。',
+            history=[],
+            session_id='sid-1',
+            filters={'lclm_mode': 'auto'},
+            files=[],
+            debug=False,
+            reasoning=False,
+            databases=[],
+            dataset='algo',
+            priority=None,
+            is_stream=False,
+        )
+    )
+
+    assert result['code'] == 200
+    assert captured['ppl'] == 'naive-pipeline'
+    assert captured['mode_tag'] == 'sync'
+    runtime_params = captured['ppl_args'][0]
+    assert runtime_params['lclm_mode'] == 'auto'
+
+
 def test_handle_chat_rejects_unknown_dataset(monkeypatch):
     chat_server = SimpleNamespace(
         sensitive_filter=SimpleNamespace(loaded=False, check=lambda query: (False, None)),

@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -171,9 +172,13 @@ func TestBuildLazyChatRequestMapsAllFields(t *testing.T) {
 			map[string]any{"role": "assistant", "content": "a1"},
 		},
 		"filters": map[string]any{
-			"kb_id":   []any{"ds_1"},
-			"creator": []any{"u1"},
-			"tags":    []any{"t1"},
+			"kb_id":              []any{"ds_1"},
+			"creator":            []any{"u1"},
+			"tags":               []any{"t1"},
+			"lclm_mode":          "force",
+			"lclm_use_llm":       false,
+			"lclm_max_depth":     float64(1),
+			"lclm_save_artifact": true,
 		},
 		"files":           []any{"f1", "f2"},
 		"reasoning":       false,
@@ -202,6 +207,16 @@ func TestBuildLazyChatRequestMapsAllFields(t *testing.T) {
 	}
 	if len(req.Filters.Tags) != 1 || req.Filters.Tags[0] != "t1" {
 		t.Fatalf("unexpected tags: %#v", req.Filters.Tags)
+	}
+	if req.FilterPayload["lclm_mode"] != "force" || req.FilterPayload["lclm_use_llm"] != false {
+		t.Fatalf("expected raw lclm filters to be preserved: %#v", req.FilterPayload)
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal lazy chat request: %v", err)
+	}
+	if !strings.Contains(string(rawReq), `"lclm_mode":"force"`) {
+		t.Fatalf("expected lclm filters in marshaled request: %s", rawReq)
 	}
 	if len(req.Files) != 2 || req.Files[0] != "f1" || req.Files[1] != "f2" {
 		t.Fatalf("unexpected files: %#v", req.Files)

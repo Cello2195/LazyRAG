@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from chat.pptx.artifact import artifact_dir, save_artifact
+from chat.components.lclm.text_sanitize import is_bad_placeholder_text, sanitize_title
 
 
 _SAFE_RE = re.compile(r'[^A-Za-z0-9._-]+')
@@ -25,6 +26,13 @@ def _safe_filename(name: str, ext: str) -> str:
     return safe
 
 
+def _normalized_artifact_title(title: str, original_query: str) -> str:
+    normalized = sanitize_title(title, original_query, fallback='长文报告')
+    if is_bad_placeholder_text(normalized):
+        normalized = sanitize_title(original_query, original_query, fallback='长文报告')
+    return normalized
+
+
 def _ext_for_format(output_format: str) -> str:
     fmt = str(output_format or 'markdown').strip().lower()
     if fmt == 'txt':
@@ -38,6 +46,7 @@ def save_longform_artifact(
     *,
     content: str,
     title: str,
+    original_query: str = '',
     output_format: str = 'markdown',
     related_artifacts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -46,7 +55,8 @@ def save_longform_artifact(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
-    filename = _safe_filename(f'{title}-{stamp}', ext)
+    normalized_title = _normalized_artifact_title(title, original_query)
+    filename = _safe_filename(f'{normalized_title}-{stamp}', ext)
     out_path = Path(out_dir) / filename
     out_path.write_text(str(content or ''), encoding='utf-8')
 

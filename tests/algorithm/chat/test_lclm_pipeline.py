@@ -112,6 +112,106 @@ def test_pipeline_warns_when_citation_required_but_no_evidence():
     assert re.search(r'\[\[\d+\]\]', state.final_markdown) is None
 
 
+def test_lclm_pipeline_emits_progress_events():
+    events = []
+
+    runtime = {
+        'lclm_mode': 'force',
+        'lclm_save_artifact': False,
+        'lclm_use_llm': False,
+        'lclm_max_outline_nodes': 1,
+        'lclm_max_depth': 1,
+        'lclm_node_evidence_topk': 0,
+        'lclm_enable_evidence': False,
+        'lclm_section_min_words': 80,
+        'lclm_section_max_words': 120,
+    }
+    pipeline = OutlineLongFormPipeline(runtime_params=runtime, progress_callback=events.append)
+    task = LongFormTaskSchema(
+        query='测试长文本任务',
+        original_query='测试长文本任务',
+        language='zh',
+        genre='report',
+        citation_required=False,
+        source_policy='kb_first',
+    )
+    outline = [
+        OutlineNode(
+            node_id='1',
+            title='背景',
+            level=1,
+            parent_id=None,
+            goal='说明背景',
+            expected_words=100,
+            retrieval_queries=['测试长文本任务 背景'],
+        )
+    ]
+    pipeline.planner.plan = lambda query, runtime_params: (task, '测试报告', outline, [])
+    pipeline.collector.collect = lambda **kwargs: ([], ['章节 1 已跳过证据检索：lclm_enable_evidence=false'])
+
+    result, _state = pipeline.run(query='测试长文本任务', history=[])
+
+    assert result['lclm']['enabled'] is True
+    stages = [str(event.get('stage')) for event in events if isinstance(event, dict)]
+    assert 'start' in stages
+    assert 'planning_start' in stages
+    assert 'planning_end' in stages
+    assert 'writer_start' in stages
+    assert 'writer_end' in stages
+    assert 'compose_start' in stages
+    assert 'compose_end' in stages
+    assert stages[-1] == 'done'
+
+
+def test_lclm_pipeline_formats_download_as_markdown_link():
+    runtime = {
+        'lclm_mode': 'force',
+        'lclm_save_artifact': True,
+        'lclm_use_llm': False,
+        'lclm_max_outline_nodes': 1,
+        'lclm_max_depth': 1,
+        'lclm_node_evidence_topk': 0,
+        'lclm_enable_evidence': False,
+        'lclm_section_min_words': 80,
+        'lclm_section_max_words': 120,
+    }
+    pipeline = OutlineLongFormPipeline(runtime_params=runtime)
+    task = LongFormTaskSchema(
+        query='测试长文本任务',
+        original_query='测试长文本任务',
+        language='zh',
+        genre='report',
+        citation_required=False,
+        source_policy='kb_first',
+    )
+    outline = [
+        OutlineNode(
+            node_id='1',
+            title='背景',
+            level=1,
+            parent_id=None,
+            goal='说明背景',
+            expected_words=100,
+            retrieval_queries=['测试长文本任务 背景'],
+        )
+    ]
+    pipeline.planner.plan = lambda query, runtime_params: (task, '测试报告', outline, [])
+    pipeline.collector.collect = lambda **kwargs: ([], ['章节 1 已跳过证据检索：lclm_enable_evidence=false'])
+    pipeline._save_artifact = lambda state, title: {
+        'artifact': {
+            'download_link': '/api/chat/artifacts/static-files/agent-results/test/report.md?sig=s&download=1',
+            'download_url': '/api/chat/artifacts/static-files/agent-results/test/report.md?sig=s&download=1',
+        },
+        'download_link': '/api/chat/artifacts/static-files/agent-results/test/report.md?sig=s&download=1',
+        'download_url': '/api/chat/artifacts/static-files/agent-results/test/report.md?sig=s&download=1',
+    }
+
+    result, _state = pipeline.run(query='测试长文本任务', history=[])
+
+    assert '下载：[点击下载](/api/chat/artifacts/static-files/agent-results/test/report.md?sig=s&download=1)' in result['text']
+    assert result['download_link'].startswith('/api/chat/artifacts/static-files/')
+
+
 def test_lclm_stream_mode_outputs_text_and_artifact(monkeypatch):
     helper_path = Path(__file__).with_name('test_pipeline_agentic.py')
     spec = importlib.util.spec_from_file_location('agentic_test_helper', helper_path)
@@ -123,8 +223,11 @@ def test_lclm_stream_mode_outputs_text_and_artifact(monkeypatch):
     except Exception as exc:  # pragma: no cover - environment compatibility fallback
         pytest.skip(f'agentic fake import unavailable in current env: {exc}')
 
-    def fake_run_lclm_pipeline(*, query, history, runtime_params):
+    def fake_run_lclm_pipeline(*, query, history, runtime_params, progress_callback=None):
         assert query == '请做长文分析'
+        if callable(progress_callback):
+            progress_callback({'stage': 'planning_start', 'text': '正在规划大纲...'})
+            progress_callback({'stage': 'planning_end', 'text': '已完成大纲规划，共 1 个章节。', 'outline_nodes': 1})
         return {
             'think': 'outline done',
             'text': '已生成长文本报告。\n\n下面是正文预览：\n这是预览内容。',
@@ -176,3 +279,5 @@ def test_lclm_stream_mode_outputs_text_and_artifact(monkeypatch):
     assert frames
     assert any(frame.get('text') for frame in frames)
     assert any(frame.get('artifact') or frame.get('download_link') for frame in frames)
+    assert all(isinstance(frame.get('text'), str) for frame in frames)
+    assert all(frame.get('text') for frame in frames)

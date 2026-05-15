@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
+import lazyllm
+
 from chat.components.lclm.schemas import EvidenceCard, LongFormTaskSchema, OutlineNode, parse_json_text
 from chat.prompts.lclm import EVIDENCE_QUERY_PROMPT
 
@@ -16,6 +18,34 @@ def _runtime_int(runtime_params: Mapping[str, Any], key: str, default: int) -> i
         return int(value)
     except Exception:
         return default
+
+
+def _runtime_bool(runtime_params: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = runtime_params.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 'yes', 'on'}:
+        return True
+    if text in {'0', 'false', 'no', 'off'}:
+        return False
+    return default
+
+
+def _log_info(message: str) -> None:
+    logger = getattr(lazyllm, 'LOG', None)
+    fn = getattr(logger, 'info', None)
+    if callable(fn):
+        fn(message)
+
+
+def _log_warning(message: str) -> None:
+    logger = getattr(lazyllm, 'LOG', None)
+    fn = getattr(logger, 'warning', None) or getattr(logger, 'info', None)
+    if callable(fn):
+        fn(message)
 
 
 def _fill_prompt(template: str, **kwargs: Any) -> str:
@@ -134,9 +164,11 @@ def _web_card_from_item(
 
 
 def _dedupe_cards(cards: Iterable[EvidenceCard], *, limit: int) -> List[EvidenceCard]:
+    if int(limit) <= 0:
+        return []
     deduped: list[EvidenceCard] = []
     seen: set[str] = set()
-    max_items = max(1, int(limit))
+    max_items = int(limit)
     for card in cards:
         key = '|'.join(
             [
@@ -242,14 +274,28 @@ class EvidenceCollector:
         runtime_params: Mapping[str, Any],
     ) -> tuple[list[EvidenceCard], list[str]]:
         warnings: list[str] = []
+        enable_evidence = _runtime_bool(runtime_params, 'lclm_enable_evidence', True)
+        node_topk = _runtime_int(runtime_params, 'lclm_node_evidence_topk', 5)
+
+        if not enable_evidence:
+            reason = 'lclm_enable_evidence=false'
+            warnings.append(f'章节 {node.node_id} 已跳过证据检索：{reason}')
+            _log_info(f'[LCLM] evidence skipped reason={reason} node_id={node.node_id}')
+            return [], warnings
+
+        if node_topk <= 0:
+            reason = f'lclm_node_evidence_topk={node_topk}'
+            warnings.append(f'章节 {node.node_id} 已跳过证据检索：{reason}')
+            _log_info(f'[LCLM] evidence skipped reason={reason} node_id={node.node_id}')
+            return [], warnings
+
         queries, claims = self._build_queries(task, node)
         if not queries:
             queries = [f'{task.query} {node.title}', node.goal]
         node.evidence_needs = claims or node.evidence_needs
         node.retrieval_queries = queries
 
-        node_topk = _runtime_int(runtime_params, 'lclm_node_evidence_topk', 5)
-        query_topk = max(2, min(node_topk, 8))
+        query_topk = max(1, min(node_topk, 8))
         cards: list[EvidenceCard] = []
 
         has_kb_context = bool(runtime_params.get('kb_id') or runtime_params.get('temp_files'))
@@ -260,47 +306,80 @@ class EvidenceCollector:
                 kb_search_fn = kb_tools.kb_search
 
             for q_idx, query in enumerate(queries[:3], start=1):
-                search_result = kb_search_fn(query=query, topk=query_topk)
+                try:
+                    search_result = kb_search_fn(query=query, topk=query_topk)
+                except Exception as exc:
+                    msg = f'章节 {node.node_id} KB 检索失败：{exc}'
+                    warnings.append(msg)
+                    _log_warning(f'[LCLM] {msg}')
+                    continue
                 for idx, item in enumerate(_extract_items(search_result), start=1):
                     cards.append(_kb_card_from_item(item, idx=(q_idx * 100 + idx), query=query))
 
         if not cards:
             warnings.append(f'章节 {node.node_id} KB 证据不足，已尝试外部补充。')
 
-        if (_should_try_arxiv(task, node) or _should_try_web(task)) and len(cards) < max(2, node_topk // 2):
+        enable_arxiv = _runtime_bool(runtime_params, 'lclm_enable_arxiv', True)
+        enable_web = _runtime_bool(runtime_params, 'lclm_enable_web', True)
+        try_arxiv = enable_arxiv and _should_try_arxiv(task, node)
+        try_web = enable_web and _should_try_web(task)
+        if (try_arxiv or try_web) and len(cards) < max(1, node_topk // 2):
             arxiv_fn = runtime_params.get('lclm_arxiv_search')
             web_fn = runtime_params.get('lclm_web_search')
-            if not callable(arxiv_fn) or not callable(web_fn):
+            if (try_arxiv and not callable(arxiv_fn)) or (try_web and not callable(web_fn)):
                 from chat.tools import web_search as web_tools
-                if not callable(arxiv_fn):
+                if try_arxiv and not callable(arxiv_fn):
                     arxiv_fn = web_tools.arxiv_search
-                if not callable(web_fn):
+                if try_web and not callable(web_fn):
                     web_fn = web_tools.web_search
 
             for query in queries[:2]:
-                if _should_try_arxiv(task, node):
-                    arxiv = arxiv_fn(query=query, max_results=min(5, query_topk))
-                    for idx, item in enumerate(_extract_items(arxiv), start=1):
-                        cards.append(
-                            _web_card_from_item(
-                                item,
-                                idx=idx,
-                                source_type='arxiv',
-                                query=query,
+                if try_arxiv:
+                    try:
+                        arxiv = arxiv_fn(query=query, max_results=min(5, query_topk))
+                    except Exception as exc:
+                        msg = f'章节 {node.node_id} arXiv 检索失败（已降级）：{exc}'
+                        warnings.append(msg)
+                        _log_warning(f'[LCLM] {msg}')
+                        arxiv = None
+                    if arxiv is None:
+                        pass
+                    else:
+                        for idx, item in enumerate(_extract_items(arxiv), start=1):
+                            cards.append(
+                                _web_card_from_item(
+                                    item,
+                                    idx=idx,
+                                    source_type='arxiv',
+                                    query=query,
+                                )
                             )
-                        )
 
-                if _should_try_web(task):
-                    web = web_fn(query=query, source='auto', topk=min(5, query_topk))
-                    for idx, item in enumerate(_extract_items(web), start=1):
-                        cards.append(
-                            _web_card_from_item(
-                                item,
-                                idx=idx,
-                                source_type='web',
-                                query=query,
+                if try_web:
+                    try:
+                        web = web_fn(query=query, source='auto', topk=min(5, query_topk))
+                    except Exception as exc:
+                        msg = f'章节 {node.node_id} Web 检索失败（已降级）：{exc}'
+                        warnings.append(msg)
+                        _log_warning(f'[LCLM] {msg}')
+                        web = None
+                    if web is None:
+                        pass
+                    else:
+                        for idx, item in enumerate(_extract_items(web), start=1):
+                            cards.append(
+                                _web_card_from_item(
+                                    item,
+                                    idx=idx,
+                                    source_type='web',
+                                    query=query,
+                                )
                             )
-                        )
+
+        if not enable_arxiv and _should_try_arxiv(task, node):
+            _log_info(f'[LCLM] evidence skipped reason=lclm_enable_arxiv=false node_id={node.node_id}')
+        if not enable_web and _should_try_web(task):
+            _log_info(f'[LCLM] evidence skipped reason=lclm_enable_web=false node_id={node.node_id}')
 
         deduped = _dedupe_cards(cards, limit=node_topk)
         if not deduped:

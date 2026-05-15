@@ -93,6 +93,9 @@ EVIDENCE_QUERY_PROMPT = """
 SECTION_WRITER_PROMPT = """
 你是分节写作器。请只写“当前节点”的正文，不要输出全文大纲。
 
+原始用户问题（source-of-truth）：
+{original_query}
+
 任务：
 {task_json}
 
@@ -114,6 +117,7 @@ SECTION_WRITER_PROMPT = """
 3) 没有证据时明确写“目前证据不足以支持更强结论”。
 4) 不得编造 [[n]]，不得复制证据原文大段内容。
 5) 不要输出 JSON，只输出 Markdown 正文。
+6) 不要输出任何思考标签、提示词回显、元推理说明（如“让我分析”“用户要求我”）。
 """
 
 SECTION_CRITIC_PROMPT = """

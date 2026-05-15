@@ -366,10 +366,18 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
     }
 
     function onMessage(e: any) {
-      const result = UIUtils.jsonParser(e.data)?.result;
+      const rawResult = UIUtils.jsonParser(e.data)?.result;
 
-      if (!result) {
+      if (!rawResult) {
         return;
+      }
+      const result: any = { ...rawResult };
+      const hasDelta =
+        typeof result.delta === "string" && result.delta.trim().length > 0;
+      const textAsDelta =
+        typeof result.text === "string" ? result.text.trim() : "";
+      if (!hasDelta && textAsDelta) {
+        result.delta = result.text;
       }
 
       const messageConversationId = result.conversation_id || "";
@@ -379,7 +387,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       const isActiveConversation = messageConversationId
         ? messageConversationId === currentConversationIdAtStart ||
           (isUsingTempId && messageConversationId)
-        : currentConversationIdAtStart === "";
+        : true;
 
       const isFirstTimeReceivingId =
         result.conversation_id &&
@@ -471,10 +479,25 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
         isMouseScrollingRef.current = true;
       }
 
-      if (
-        result.finish_reason !==
-        ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified
-      ) {
+      const finishReason =
+        typeof result.finish_reason === "string" ? result.finish_reason : "";
+      const hasTerminalFinishReason =
+        !!finishReason &&
+        finishReason !==
+          ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified;
+      const statusText =
+        typeof result.status === "string" ? result.status.toUpperCase() : "";
+      const hasTerminalStatus =
+        statusText === "FINISHED" || statusText === "FAILED";
+
+      if (!result.finish_reason && hasTerminalStatus) {
+        result.finish_reason =
+          statusText === "FAILED"
+            ? ChatConversationsResponseFinishReasonEnum.FinishReasonUnknown
+            : ChatConversationsResponseFinishReasonEnum.FinishReasonStop;
+      }
+
+      if (hasTerminalFinishReason || hasTerminalStatus) {
         if (isActiveConversation) {
           closeSSE();
         }

@@ -158,6 +158,16 @@ class StreamManager {
           }
           if (result.finish_reason) {
             state.finish_reason = result.finish_reason;
+          } else if (
+            typeof result.status === "string" &&
+            result.status.toUpperCase() === "FINISHED"
+          ) {
+            state.finish_reason = "FINISH_REASON_STOP";
+          } else if (
+            typeof result.status === "string" &&
+            result.status.toUpperCase() === "FAILED"
+          ) {
+            state.finish_reason = "FINISH_REASON_UNKNOWN";
           }
           if (result.messageId) {
             state.messageId = result.messageId;
