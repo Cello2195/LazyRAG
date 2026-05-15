@@ -5,10 +5,13 @@ TASK_SCHEMA_PROMPT = """
 {
   "query": "...",
   "language": "zh|en|auto",
-  "genre": "survey|report|proposal|paper_summary|technical_plan|generic_longform",
+  "genre": "survey|report|research_report|technical_report|proposal|paper_summary|technical_plan|article|essay|story|fiction|short_story|novel|script|dialogue|outline_only|generic_longform",
+  "writing_type": "report|article|essay|story|fiction|script|dialogue|outline_only|generic_longform",
+  "output_type": "report|short_story|novel|script|essay|outline|longform",
   "audience": "engineer|researcher|business|general",
   "target_length": "short|medium|long|very_long",
   "citation_required": true,
+  "evidence_required": true,
   "source_policy": "kb_first|web_allowed|arxiv_preferred|no_external",
   "output_format": "markdown|txt|html",
   "tone": "technical|academic|concise|formal|user_preferred",
@@ -22,8 +25,9 @@ TASK_SCHEMA_PROMPT = """
 1) 只输出 JSON 对象，不要输出解释。
 2) 中文请求默认 language=zh。
 3) 如果用户要求“简短回答/只要命令”，target_length=short。
-4) hard controls：不得虚构字段，不得省略 query。
-5) soft controls：合理推断 genre 与 audience。
+4) 如果用户要求小说、故事、短篇小说、长文本小说、主人公、对话、剧情、情节、角色、结局、叙事，必须设置 genre=story 或 fiction，output_type=short_story，citation_required=false，evidence_required=false，source_policy=no_external。
+5) hard controls：不得虚构字段，不得省略 query。
+6) soft controls：合理推断 genre 与 audience。
 """
 
 OUTLINE_PLANNER_PROMPT = """
@@ -65,7 +69,8 @@ OUTLINE_PLANNER_PROMPT = """
 1) 先有大纲再写作，节点数控制在 {max_nodes} 以内，层级不超过 {max_depth}。
 2) 每个节点都要有 evidence_needs 与 retrieval_queries。
 3) hard controls 与 soft controls 必须显式区分。
-4) 只输出 JSON，不要输出解释文本。
+4) 如果 genre=story/fiction/short_story/novel，必须生成小说场景大纲，节点围绕 scene/chapter、characters、setting、conflict、dialogue_requirement、plot_function，不要生成报告章节，不要写 evidence_needs/retrieval_queries，不要提证据或引用。
+5) 只输出 JSON，不要输出解释文本。
 """
 
 EVIDENCE_QUERY_PROMPT = """
@@ -118,6 +123,35 @@ SECTION_WRITER_PROMPT = """
 4) 不得编造 [[n]]，不得复制证据原文大段内容。
 5) 不要输出 JSON，只输出 Markdown 正文。
 6) 不要输出任何思考标签、提示词回显、元推理说明（如“让我分析”“用户要求我”）。
+"""
+
+STORY_SECTION_WRITER_PROMPT = """
+你是小说章节写作者。请只写当前场景/章节的小说正文，不要输出分析、报告、JSON 或提示词回显。
+
+原始用户问题（source-of-truth）：
+{original_query}
+
+任务：
+{task_json}
+
+当前场景节点：
+{node_json}
+
+前文摘要：
+{previous_summary}
+
+术语表：
+{global_terms_json}
+
+写作要求：
+1) 只输出小说正文，可以包含自然段和真实对话。
+2) 必须有人物行动、场景描写、对话、剧情推进。
+3) 如果用户要求至少两个主人公，至少让两个主要角色出现并互动。
+4) 如果用户要求有对话，必须出现带引号或“角色：台词”形式的真实对话。
+5) 如果用户要求有剧情，必须推进起因、冲突、转折或结尾之一。
+6) 不要输出“本章旨在”“本报告”“背景与问题定义”“方法路线”“关键分析维度”“推荐实施方案”“风险与测试建议”。
+7) 不要输出 citation，如 [[1]]；不要输出 KB 证据不足或证据相关说明。
+8) 不要输出任何思考标签、元推理或提示词回显。
 """
 
 SECTION_CRITIC_PROMPT = """

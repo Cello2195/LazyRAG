@@ -614,10 +614,30 @@ func streamSingleAnswer(
 	})
 	for d := range ch {
 		if d.ReasoningText != "" {
-			pendingThink += d.ReasoningText
 			if d.Text == "" && len(d.Sources) == 0 {
+				thinkDelta := "<think>" + d.ReasoningText + "</think>"
+				fullResult += thinkDelta
+				chunk := &ChatChunkResponse{
+					ConversationID:    convID,
+					Seq:               int32(seq),
+					Message:           "",
+					Delta:             thinkDelta,
+					FinishReason:      "FINISH_REASON_UNSPECIFIED",
+					HistoryID:         historyID,
+					Sources:           nil,
+					PromptQuestions:   []string{},
+					ReasoningContent:  "",
+					ThinkingDurationS: int64(time.Since(thinkStart).Seconds()),
+				}
+				if reqCtx.Err() == nil {
+					writeSSEChunk(w, flusher, chunk)
+				}
+				if rdb != nil {
+					_ = appendChatChunk(chatCtx, rdb, convID, historyID, chunk)
+				}
 				continue
 			}
+			pendingThink += d.ReasoningText
 		}
 		if pendingThink != "" {
 			fullResult += "<think>" + pendingThink + "</think>"
@@ -755,10 +775,25 @@ func streamDualAnswer(
 	var writeMu sync.Mutex
 	appendPrimary := func(delta, reasoning string, sources []any) {
 		if reasoning != "" {
-			primaryPendingThink += reasoning
 			if delta == "" && len(sources) == 0 {
+				thinkDelta := "<think>" + reasoning + "</think>"
+				primaryResult += thinkDelta
+				if reqCtx.Err() == nil {
+					writeMu.Lock()
+					writeSSEChunk(w, flusher, map[string]any{
+						"conversation_id": convID, "seq": seq, "delta": thinkDelta, "history_id": historyID,
+					})
+					writeMu.Unlock()
+				}
+				if rdb != nil {
+					_ = appendChatChunk(chatCtx, rdb, convID, historyID, &ChatChunkResponse{
+						ConversationID: convID, Seq: int32(seq), Delta: thinkDelta, HistoryID: historyID,
+						ReasoningContent: "", Sources: sources,
+					})
+				}
 				return
 			}
+			primaryPendingThink += reasoning
 		}
 		if primaryPendingThink != "" {
 			primaryResult += "<think>" + primaryPendingThink + "</think>"
@@ -787,10 +822,25 @@ func streamDualAnswer(
 	}
 	appendSecondary := func(delta, reasoning string, sources []any) {
 		if reasoning != "" {
-			secondaryPendingThink += reasoning
 			if delta == "" && len(sources) == 0 {
+				thinkDelta := "<think>" + reasoning + "</think>"
+				secondaryResult += thinkDelta
+				if reqCtx.Err() == nil {
+					writeMu.Lock()
+					writeSSEChunk(w, flusher, map[string]any{
+						"conversation_id": convID, "seq": seq, "delta": thinkDelta, "history_id": secondaryHistoryID,
+					})
+					writeMu.Unlock()
+				}
+				if rdb != nil {
+					_ = appendChatChunk(chatCtx, rdb, convID, secondaryHistoryID, &ChatChunkResponse{
+						ConversationID: convID, Seq: int32(seq), Delta: thinkDelta, HistoryID: secondaryHistoryID,
+						ReasoningContent: "", Sources: sources,
+					})
+				}
 				return
 			}
+			secondaryPendingThink += reasoning
 		}
 		if secondaryPendingThink != "" {
 			secondaryResult += "<think>" + secondaryPendingThink + "</think>"

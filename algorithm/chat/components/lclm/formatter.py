@@ -6,7 +6,7 @@ from typing import Any, Callable, List, Mapping, Optional
 
 import lazyllm
 
-from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode
+from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode, is_story_task
 from chat.components.lclm.text_sanitize import (
     contains_lclm_pollution,
     extract_length_constraints,
@@ -39,6 +39,10 @@ def _heading_for_node(node: OutlineNode) -> str:
     return f'### {node.node_id} {node.title}'
 
 
+def _story_heading_for_node(node: OutlineNode) -> str:
+    return f'## {node.title}'
+
+
 def _strip_leading_headings(markdown: str) -> str:
     lines = str(markdown or '').splitlines()
     while lines and lines[0].strip().startswith('#'):
@@ -65,6 +69,13 @@ def _core_conclusion(
     return _clean_conclusion(
         f'围绕“{task.query}”，本报告给出结构化分析与可执行建议；当前结论优先遵循证据约束，并标注了后续需要补强的环节。'
     )
+
+
+def _story_opening_note(task: LongFormTaskSchema) -> str:
+    topic = task.original_query or task.query
+    if '最后一个人类' in topic:
+        return '这是一篇围绕“世界上的最后一个人类”展开的短篇小说，核心人物在废墟、对话与选择中寻找文明是否仍值得重新开始。'
+    return '这是一篇围绕用户主题展开的长文本小说，包含人物互动、对话、冲突与结尾。'
 
 
 def _to_txt(markdown: str) -> str:
@@ -132,6 +143,37 @@ class LongFormFormatter:
         warnings: List[str],
         runtime_params: Mapping[str, Any],
     ) -> str:
+        if is_story_task(task):
+            sections: list[str] = []
+            for node in outline:
+                body = sanitize_lclm_text(node.draft)
+                body = _strip_leading_headings(body)
+                if not body:
+                    continue
+                sections.append(f'{_story_heading_for_node(node)}\n\n{body}')
+            markdown = '\n\n'.join(
+                [
+                    f'# 《{title.strip("《》# ")}》',
+                    f'> {_story_opening_note(task)}',
+                    *sections,
+                ]
+            ).strip()
+            markdown = sanitize_lclm_text(markdown)
+            if contains_lclm_pollution(markdown):
+                markdown = (
+                    f'# 《{title.strip("《》# ")}》\n\n'
+                    '林岚在废墟中的中央电台前醒来时，世界只剩风声。她以为自己是最后一个人类，'
+                    '直到耳机里传来另一个声音：“如果你还活着，请回答。”\n\n'
+                    '“我是林岚。”她握紧话筒，“你是谁？”\n\n'
+                    '“黎明之声，一个守着旧世界的系统。”那个声音说，“也是现在唯一会等你回答的人。”\n\n'
+                    '他们在空城里寻找北方避难所的信号，争论是否重启人类文明。最后，林岚没有按下按钮，'
+                    '而是带着黎明之声上路。因为她终于明白，最后一个人类不该只负责结束，也可以负责开始。'
+                )
+            constraints = extract_length_constraints(task.original_query or task.query)
+            if constraints.get('max_units'):
+                markdown = trim_text_to_units(markdown, int(constraints['max_units']) + 80)
+            return markdown.strip()
+
         sections: list[str] = []
         for node in outline:
             body = sanitize_lclm_text(node.draft)

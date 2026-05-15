@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 import lazyllm
 
-from chat.components.lclm.schemas import EvidenceCard, LongFormTaskSchema, OutlineNode, parse_json_text
+from chat.components.lclm.schemas import EvidenceCard, LongFormTaskSchema, OutlineNode, is_story_task, parse_json_text
 from chat.prompts.lclm import EVIDENCE_QUERY_PROMPT
 
 
@@ -276,6 +276,11 @@ class EvidenceCollector:
         warnings: list[str] = []
         enable_evidence = _runtime_bool(runtime_params, 'lclm_enable_evidence', True)
         node_topk = _runtime_int(runtime_params, 'lclm_node_evidence_topk', 5)
+
+        if is_story_task(task) and not bool(getattr(task, 'evidence_required', False)):
+            reason = 'creative_story_no_external_evidence'
+            _log_info(f'[LCLM] evidence skipped reason={reason} node_id={node.node_id}')
+            return [], warnings
 
         if not enable_evidence:
             reason = 'lclm_enable_evidence=false'

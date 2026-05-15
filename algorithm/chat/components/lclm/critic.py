@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Callable, List, Mapping, Optional
 
-from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode, parse_json_text
+from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode, is_story_task, parse_json_text
 from chat.prompts.lclm import SECTION_CRITIC_PROMPT
 
 
@@ -14,6 +14,19 @@ _PLACEHOLDER_RE = re.compile(
 )
 _CITATION_RE = re.compile(r'\[\[\d+\]\]')
 _HEADING_RE = re.compile(r'^\s{0,3}#{1,6}\s+\S+', re.MULTILINE)
+_REPORT_TERMS = (
+    '本报告',
+    '长文报告',
+    '背景与问题定义',
+    '方法路线总览',
+    '关键分析维度',
+    '对 LazyRAG 的启发',
+    '推荐实施方案',
+    '风险与测试建议',
+    'KB 证据不足',
+    '未检索到可用证据卡',
+    '目前证据不足以支持更强结论',
+)
 
 
 def _runtime_int(runtime_params: Mapping[str, Any], key: str, default: int) -> int:
@@ -92,6 +105,47 @@ def _build_result(
     }
 
 
+def _has_dialogue(text: str) -> bool:
+    return bool(re.search(r'[“"].+?[”"]', str(text or '')) or re.search(r'^[\u4e00-\u9fffA-Za-z]{1,12}[:：].+', str(text or ''), re.MULTILINE))
+
+
+def _story_critic(
+    *,
+    section_text: str,
+    task: LongFormTaskSchema,
+    node: OutlineNode,
+    runtime_params: Mapping[str, Any],
+) -> dict[str, Any]:
+    issues: list[str] = []
+    repairs: list[str] = []
+    text = str(section_text or '').strip()
+    if not text:
+        return _build_result(
+            passed=False,
+            issues=['场景内容为空。'],
+            repair_instructions=['补写小说正文，包含人物行动、场景描写和剧情推进。'],
+        )
+    if any(term in text for term in _REPORT_TERMS):
+        issues.append('场景混入报告/证据/RAG 话术。')
+        repairs.append('删除报告分析语言，只保留小说正文。')
+    if _CITATION_RE.search(text):
+        issues.append('小说场景不应包含 citation 占位符。')
+        repairs.append('移除 [[n]] 引用。')
+    if not _has_dialogue(text):
+        issues.append('场景缺少真实对话。')
+        repairs.append('加入至少一段角色之间的直接对话。')
+    units = _word_units(text)
+    min_words = _runtime_int(runtime_params, 'lclm_section_min_words', 120)
+    if units < max(60, int(min_words * 0.5)):
+        issues.append(f'场景长度偏短（约 {units} 字）。')
+        repairs.append('补充动作、环境和人物选择。')
+    topic = task.original_query or task.query
+    if '最后一个人类' in topic and '最后' not in text and '人类' not in text:
+        issues.append('场景没有贴合“世界上的最后一个人类”主题。')
+        repairs.append('明确呈现最后一个人类的处境或选择。')
+    return _build_result(passed=not issues, issues=issues, repair_instructions=repairs)
+
+
 def _rule_critic(
     *,
     section_text: str,
@@ -99,6 +153,14 @@ def _rule_critic(
     node: OutlineNode,
     runtime_params: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if is_story_task(task):
+        return _story_critic(
+            section_text=section_text,
+            task=task,
+            node=node,
+            runtime_params=runtime_params,
+        )
+
     issues: list[str] = []
     repairs: list[str] = []
     text = str(section_text or '').strip()

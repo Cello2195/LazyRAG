@@ -9,6 +9,7 @@ from chat.components.lclm.schemas import (
     OutlineNode,
     coerce_outline_nodes,
     coerce_task_schema,
+    is_story_task,
     parse_json_text,
 )
 from chat.components.lclm.text_sanitize import (
@@ -17,6 +18,37 @@ from chat.components.lclm.text_sanitize import (
     sanitize_title,
 )
 from chat.prompts.lclm import OUTLINE_PLANNER_PROMPT, TASK_SCHEMA_PROMPT
+
+_STORY_KEYWORDS = (
+    '小说',
+    '故事',
+    '短篇小说',
+    '长篇小说',
+    '长文本小说',
+    '主人公',
+    '对话',
+    '剧情',
+    '情节',
+    '角色',
+    '结局',
+    '叙事',
+    'fiction',
+    'story',
+    'short story',
+    'novel',
+)
+_REPORT_TITLE_TERMS = (
+    '背景与问题定义',
+    '方法路线总览',
+    '关键分析维度',
+    '对 LazyRAG 的启发',
+    '推荐实施方案',
+    '风险与测试建议',
+    '长文报告',
+    '报告',
+    '证据',
+    '引用',
+)
 
 
 def _runtime_int(runtime_params: Mapping[str, Any], key: str, default: int) -> int:
@@ -51,6 +83,8 @@ def _guess_language(query: str) -> str:
 
 def _guess_genre(query: str) -> str:
     text = str(query or '').lower()
+    if _is_story_query(text):
+        return 'story'
     if any(k in text for k in ('survey', '综述', '研究现状', 'literature review')):
         return 'survey'
     if any(k in text for k in ('paper summary', '论文总结', '论文解读')):
@@ -60,6 +94,11 @@ def _guess_genre(query: str) -> str:
     if any(k in text for k in ('report', '报告', '调研')):
         return 'report'
     return 'generic_longform'
+
+
+def _is_story_query(query: str) -> bool:
+    text = str(query or '').lower()
+    return any(k in text for k in _STORY_KEYWORDS)
 
 
 def _guess_audience(query: str) -> str:
@@ -95,6 +134,8 @@ def _guess_output_format(query: str) -> str:
 
 def _guess_source_policy(query: str, runtime_params: Mapping[str, Any]) -> str:
     text = str(query or '').lower()
+    if _is_story_query(text):
+        return 'no_external'
     if any(k in text for k in ('arxiv', 'paper', '论文', '文献')):
         return 'arxiv_preferred'
     if runtime_params.get('kb_id') or runtime_params.get('temp_files'):
@@ -104,10 +145,32 @@ def _guess_source_policy(query: str, runtime_params: Mapping[str, Any]) -> str:
     return 'kb_first'
 
 
+def _story_title_from_query(query: str) -> str:
+    text = str(query or '').strip()
+    quoted = re.findall(r'[“"「《](.*?)[”"」》]', text)
+    topic = quoted[0].strip() if quoted else text
+    if '最后一个人类' in topic or '最后的人类' in topic:
+        return '最后的人类与黎明之声'
+    topic = re.sub(r'^(请|帮我|请以|以)', '', topic).strip(' ，。,.')
+    topic = re.sub(r'(为主题|写一篇|生成|长文本|短篇小说|小说|故事).*$', '', topic).strip(' ，。,.')
+    return topic or '最后的人类与黎明之声'
+
+
+def _enforce_story_task(task: LongFormTaskSchema) -> LongFormTaskSchema:
+    task.genre = 'story'
+    task.writing_type = 'fiction'
+    task.output_type = 'short_story'
+    task.citation_required = False
+    task.evidence_required = False
+    task.source_policy = 'no_external'
+    task.tone = 'literary'
+    return task
+
+
 def _fallback_task_schema(query: str, runtime_params: Mapping[str, Any]) -> LongFormTaskSchema:
     mode = str(runtime_params.get('lclm_mode') or 'auto').strip().lower() or 'auto'
     original_query = str(runtime_params.get('original_query') or query or '').strip()
-    return LongFormTaskSchema(
+    task = LongFormTaskSchema(
         query=original_query or str(query or '').strip(),
         original_query=original_query or str(query or '').strip(),
         language=_guess_language(query),
@@ -120,9 +183,22 @@ def _fallback_task_schema(query: str, runtime_params: Mapping[str, Any]) -> Long
         tone='technical',
         lclm_mode=mode,
     )
+    if _is_story_query(original_query or query):
+        task = _enforce_story_task(task)
+    return task
 
 
 def _rule_outline_template(task: LongFormTaskSchema) -> list[tuple[int, str, str]]:
+    if is_story_task(task):
+        return [
+            (1, '开场：废墟中的最后电台', '在荒废世界中建立孤独、废墟与未知信号的开端。'),
+            (1, '第一位主人公登场：最后一个人类', '让最后的人类带着具体欲望、恐惧和行动进入故事。'),
+            (1, '第二位主人公登场：黎明之声', '引入 AI、休眠者或克隆体式的第二主人公，并让两者发生互动。'),
+            (1, '冲突：是否重启人类文明', '围绕选择、代价和信任制造核心冲突。'),
+            (1, '对话与选择', '通过真实对话推进人物关系和价值抉择。'),
+            (1, '转折：最后的人类并不孤独', '制造认知反转，让故事进入新的道德困境。'),
+            (1, '结局：黎明之前', '完成结尾，回应世界上最后一个人类的主题。'),
+        ]
     if task.genre in ('survey', 'paper_summary'):
         return [
             (1, '背景与问题定义', '界定研究问题、范围与评价标准。'),
@@ -165,11 +241,14 @@ def _fallback_outline(
     section_words: int,
 ) -> tuple[str, List[OutlineNode]]:
     nodes: list[OutlineNode] = []
-    outline_title = sanitize_title(
-        f'{task.original_query or task.query} - 长文报告',
-        task.original_query or task.query,
-        fallback='长文报告',
-    )
+    if is_story_task(task):
+        outline_title = _story_title_from_query(task.original_query or task.query)
+    else:
+        outline_title = sanitize_title(
+            f'{task.original_query or task.query} - 长文报告',
+            task.original_query or task.query,
+            fallback='长文报告',
+        )
     template = _rule_outline_template(task)[:max_nodes]
     parent_by_level: dict[int, str] = {}
     for idx, (level, title, goal) in enumerate(template, start=1):
@@ -190,28 +269,52 @@ def _fallback_outline(
                 parent_id=parent_id,
                 goal=goal,
                 expected_words=expected_words,
-                evidence_needs=[
+                evidence_needs=[] if is_story_task(task) else [
                     f'{title} 的关键事实依据',
                     f'{title} 的典型案例或对比信息',
                 ],
-                retrieval_queries=[
+                retrieval_queries=[] if is_story_task(task) else [
                     f'{task.original_query or task.query} {title} 关键要点',
                     f'{title} 风险 限制 实践',
                 ],
-                hard_controls={
-                    'no_hallucination': True,
-                    'citation_required': bool(task.citation_required),
-                },
-                soft_controls={
-                    'style': task.tone,
-                    'audience': task.audience,
-                    'avoid_redundancy': True,
-                },
-                tool_policy={
-                    'kb_first': task.source_policy in {'kb_first', 'arxiv_preferred'},
-                    'web_allowed': task.source_policy in {'web_allowed', 'arxiv_preferred'},
-                    'arxiv_preferred': task.source_policy == 'arxiv_preferred',
-                },
+                hard_controls=(
+                    {
+                        'scene_id': node_id,
+                        'scene_title': title,
+                        'narrative_goal': goal,
+                        'characters': ['最后一个人类', '黎明之声'],
+                        'dialogue_requirement': '至少包含一次真实对话',
+                        'plot_function': title,
+                        'citation_required': False,
+                    }
+                    if is_story_task(task)
+                    else {
+                        'no_hallucination': True,
+                        'citation_required': bool(task.citation_required),
+                    }
+                ),
+                soft_controls=(
+                    {
+                        'style': 'literary',
+                        'setting': '末日后的废墟世界',
+                        'conflict': '是否重启人类文明，以及重启的代价',
+                    }
+                    if is_story_task(task)
+                    else {
+                        'style': task.tone,
+                        'audience': task.audience,
+                        'avoid_redundancy': True,
+                    }
+                ),
+                tool_policy=(
+                    {'evidence_required': False, 'external_search': False}
+                    if is_story_task(task)
+                    else {
+                        'kb_first': task.source_policy in {'kb_first', 'arxiv_preferred'},
+                        'web_allowed': task.source_policy in {'web_allowed', 'arxiv_preferred'},
+                        'arxiv_preferred': task.source_policy == 'arxiv_preferred',
+                    }
+                ),
             )
         )
     return outline_title, nodes
@@ -265,6 +368,8 @@ class LCLMPlanner:
         parsed.original_query = original_query or parsed.original_query or parsed.query
         if self._is_invalid_schema_output(parsed, original_query):
             return fallback
+        if _is_story_query(original_query or query) or is_story_task(parsed):
+            parsed = _enforce_story_task(parsed)
         # Keep fallback defaults when LLM misses key fields.
         if parsed.genre == 'generic_longform' and fallback.genre != 'generic_longform':
             parsed.genre = fallback.genre
@@ -275,6 +380,36 @@ class LCLMPlanner:
         parsed.query = sanitize_title(parsed.query, original_query or parsed.query, fallback='长文本任务')
         parsed.original_query = original_query or parsed.original_query or parsed.query
         return parsed
+
+    @staticmethod
+    def _is_report_outline_for_story(title: str, nodes: List[OutlineNode]) -> bool:
+        haystack = ' '.join([title] + [node.title for node in nodes] + [node.goal for node in nodes])
+        return any(term in haystack for term in _REPORT_TITLE_TERMS)
+
+    @staticmethod
+    def _normalize_story_nodes(task: LongFormTaskSchema, nodes: List[OutlineNode]) -> List[OutlineNode]:
+        for idx, node in enumerate(nodes, start=1):
+            if any(term in node.title for term in _REPORT_TITLE_TERMS):
+                node.title = _rule_outline_template(task)[min(idx - 1, len(_rule_outline_template(task)) - 1)][1]
+            node.evidence_needs = []
+            node.retrieval_queries = []
+            node.tool_policy = {'evidence_required': False, 'external_search': False}
+            node.hard_controls = {
+                **(node.hard_controls if isinstance(node.hard_controls, dict) else {}),
+                'scene_id': node.node_id,
+                'scene_title': node.title,
+                'narrative_goal': node.goal,
+                'characters': ['最后一个人类', '黎明之声'],
+                'dialogue_requirement': '至少包含一次真实对话',
+                'citation_required': False,
+            }
+            node.soft_controls = {
+                **(node.soft_controls if isinstance(node.soft_controls, dict) else {}),
+                'style': 'literary',
+                'setting': '末日后的废墟世界',
+                'conflict': '是否重启人类文明，以及重启的代价',
+            }
+        return nodes
 
     def build_outline(
         self,
@@ -319,7 +454,10 @@ class LCLMPlanner:
             title = ''
             if isinstance(parsed, dict):
                 title = str(parsed.get('title') or '').strip()
-            title = sanitize_title(title or fallback_title, task.original_query or task.query, fallback='长文报告')
+            title = _story_title_from_query(task.original_query or task.query) if is_story_task(task) else sanitize_title(title or fallback_title, task.original_query or task.query, fallback='长文报告')
+            if is_story_task(task) and self._is_report_outline_for_story(title, nodes):
+                warnings.append('story_outline_report_shape_fallback')
+                return fallback_title, fallback_nodes, warnings
             for idx, node in enumerate(nodes, start=1):
                 if is_bad_placeholder_text(node.title):
                     node.title = f'章节 {idx}'
@@ -327,8 +465,12 @@ class LCLMPlanner:
                     node.goal = f'围绕 {task.original_query or task.query} 进行分析。'
                 node.evidence_needs = [x for x in node.evidence_needs if not is_bad_placeholder_text(x)]
                 node.retrieval_queries = [x for x in node.retrieval_queries if not is_bad_placeholder_text(x)]
-                if not node.retrieval_queries:
+                if is_story_task(task):
+                    node.retrieval_queries = []
+                elif not node.retrieval_queries:
                     node.retrieval_queries = [f'{task.original_query or task.query} {node.title}']
+            if is_story_task(task):
+                nodes = self._normalize_story_nodes(task, nodes)
             return title, nodes, warnings
 
         # One repair round for broken JSON output.
@@ -349,11 +491,14 @@ class LCLMPlanner:
             if isinstance(repaired_parsed, dict):
                 repaired_title = str(repaired_parsed.get('title') or '').strip()
             warnings.append('outline_planner_repaired_json')
-            repaired_title = sanitize_title(
+            repaired_title = _story_title_from_query(task.original_query or task.query) if is_story_task(task) else sanitize_title(
                 repaired_title or fallback_title,
                 task.original_query or task.query,
                 fallback='长文报告',
             )
+            if is_story_task(task) and self._is_report_outline_for_story(repaired_title, repaired_nodes):
+                warnings.append('story_outline_repaired_report_shape_fallback')
+                return fallback_title, fallback_nodes, warnings
             for idx, node in enumerate(repaired_nodes, start=1):
                 if is_bad_placeholder_text(node.title):
                     node.title = f'章节 {idx}'
@@ -361,8 +506,12 @@ class LCLMPlanner:
                     node.goal = f'围绕 {task.original_query or task.query} 进行分析。'
                 node.evidence_needs = [x for x in node.evidence_needs if not is_bad_placeholder_text(x)]
                 node.retrieval_queries = [x for x in node.retrieval_queries if not is_bad_placeholder_text(x)]
-                if not node.retrieval_queries:
+                if is_story_task(task):
+                    node.retrieval_queries = []
+                elif not node.retrieval_queries:
                     node.retrieval_queries = [f'{task.original_query or task.query} {node.title}']
+            if is_story_task(task):
+                repaired_nodes = self._normalize_story_nodes(task, repaired_nodes)
             return repaired_title, repaired_nodes, warnings
 
         warnings.append('outline_planner_parse_failed_rule_fallback')

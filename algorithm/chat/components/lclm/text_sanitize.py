@@ -78,6 +78,8 @@ def is_bad_placeholder_text(text: Any) -> bool:
 def sanitize_title(title: Any, original_query: str, *, fallback: str = '长文报告') -> str:
     raw = strip_model_thinking(title).strip()
     raw = raw.replace('<QUERY>', '').replace('<query>', '').strip()
+    if raw.lower().strip(' :：-') == 'survey on':
+        raw = ''
     if is_bad_placeholder_text(raw):
         candidate = str(original_query or '').strip()
         if not candidate:

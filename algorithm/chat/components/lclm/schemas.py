@@ -112,9 +112,12 @@ class LongFormTaskSchema:
     original_query: str = ''
     language: str = 'zh'
     genre: str = 'generic_longform'
+    writing_type: str = 'generic_longform'
+    output_type: str = 'longform'
     audience: str = 'general'
     target_length: str = 'long'
     citation_required: bool = True
+    evidence_required: bool = True
     source_policy: str = 'kb_first'
     output_format: str = 'markdown'
     tone: str = 'technical'
@@ -137,14 +140,29 @@ class LongFormTaskSchema:
             original_query=original_query,
             language=str(data.get('language') or 'zh').strip().lower() or 'zh',
             genre=str(data.get('genre') or 'generic_longform').strip().lower() or 'generic_longform',
+            writing_type=str(data.get('writing_type') or data.get('genre') or 'generic_longform').strip().lower() or 'generic_longform',
+            output_type=str(data.get('output_type') or data.get('writing_type') or data.get('genre') or 'longform').strip().lower() or 'longform',
             audience=str(data.get('audience') or 'general').strip().lower() or 'general',
             target_length=str(data.get('target_length') or 'long').strip().lower() or 'long',
             citation_required=bool(data.get('citation_required', True)),
+            evidence_required=bool(data.get('evidence_required', data.get('citation_required', True))),
             source_policy=str(data.get('source_policy') or 'kb_first').strip().lower() or 'kb_first',
             output_format=str(data.get('output_format') or 'markdown').strip().lower() or 'markdown',
             tone=str(data.get('tone') or 'technical').strip().lower() or 'technical',
             lclm_mode=str(data.get('lclm_mode') or 'auto').strip().lower() or 'auto',
         )
+
+
+STORY_GENRES = {'story', 'fiction', 'short_story', 'novel', 'creative_writing'}
+
+
+def is_story_task(task: LongFormTaskSchema) -> bool:
+    values = {
+        str(task.genre or '').strip().lower(),
+        str(task.writing_type or '').strip().lower(),
+        str(task.output_type or '').strip().lower(),
+    }
+    return bool(values & STORY_GENRES)
 
 
 @dataclass

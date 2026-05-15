@@ -8,7 +8,7 @@ import pytest
 from chat.components.lclm.evidence import EvidenceCollector
 from chat.components.lclm.pipeline import OutlineLongFormPipeline
 from chat.components.lclm.planner import LCLMPlanner
-from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode
+from chat.components.lclm.schemas import LongFormTaskSchema, OutlineNode, is_story_task
 
 
 def test_planner_fallback_when_outline_json_invalid():
@@ -212,6 +212,48 @@ def test_lclm_pipeline_formats_download_as_markdown_link():
     assert result['download_link'].startswith('/api/chat/artifacts/static-files/')
 
 
+def test_story_query_uses_fiction_workflow_without_evidence():
+    query = '请以“世界上的最后一个人类”为主题，写一篇至少有两个主人公、有对话、有剧情的长文本短篇小说'
+    runtime = {
+        'lclm_mode': 'force',
+        'lclm_save_artifact': False,
+        'lclm_use_llm': False,
+        'lclm_max_outline_nodes': 4,
+        'lclm_max_depth': 1,
+        'lclm_section_min_words': 100,
+        'lclm_section_max_words': 220,
+    }
+    pipeline = OutlineLongFormPipeline(runtime_params=runtime)
+
+    result, state = pipeline.run(query=query, history=[])
+
+    bad_terms = [
+        '长文报告',
+        '背景与问题定义',
+        '方法路线总览',
+        '关键分析维度',
+        '对 LazyRAG 的启发',
+        '推荐实施方案',
+        '风险与测试建议',
+        'KB 证据不足',
+        '未检索到可用证据卡',
+        '目前证据不足以支持更强结论',
+    ]
+    combined = result['text'] + '\n' + state.final_markdown
+    assert is_story_task(state.task)
+    assert state.task.genre == 'story'
+    assert state.task.citation_required is False
+    assert state.task.evidence_required is False
+    assert result['lclm']['genre'] == 'story'
+    assert result['lclm']['output_type'] == 'short_story'
+    assert '已生成长文本小说' in result['text']
+    assert all(term not in combined for term in bad_terms)
+    assert re.search(r'\[\[\d+\]\]', combined) is None
+    assert '“' in state.final_markdown or '"' in state.final_markdown
+    assert '林岚' in state.final_markdown
+    assert '黎明之声' in state.final_markdown
+
+
 def test_lclm_stream_mode_outputs_text_and_artifact(monkeypatch):
     helper_path = Path(__file__).with_name('test_pipeline_agentic.py')
     spec = importlib.util.spec_from_file_location('agentic_test_helper', helper_path)
@@ -277,7 +319,11 @@ def test_lclm_stream_mode_outputs_text_and_artifact(monkeypatch):
     frames = asyncio.run(_collect())
 
     assert frames
-    assert any(frame.get('text') for frame in frames)
+    final_frame = frames[-1]
+    progress_frames = frames[:-1]
+    assert any(frame.get('think') for frame in progress_frames)
+    assert all(frame.get('text') == '' for frame in progress_frames)
+    assert final_frame.get('text')
     assert any(frame.get('artifact') or frame.get('download_link') for frame in frames)
     assert all(isinstance(frame.get('text'), str) for frame in frames)
-    assert all(frame.get('text') for frame in frames)
+    assert final_frame.get('finish_reason') == 'FINISH_REASON_STOP'

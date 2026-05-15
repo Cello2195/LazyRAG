@@ -580,9 +580,13 @@ async def _lclm_forward_stream(
         lazyllm.locals._init_sid(local_sid)
         lazyllm.globals['agentic_config'] = runtime_params
         yield _stream_frame(
-            think='LCLM workflow started',
-            text='正在启动长文本生成流程...',
-            extra={'finish_reason': 'FINISH_REASON_UNSPECIFIED'},
+            think='正在启动长文本生成流程...',
+            text='',
+            extra={
+                'event': 'progress',
+                'lclm_progress': {'stage': 'stream_start', 'text': '正在启动长文本生成流程...'},
+                'finish_reason': 'FINISH_REASON_UNSPECIFIED',
+            },
         )
 
         final_result: Optional[dict[str, Any]] = None
@@ -598,10 +602,15 @@ async def _lclm_forward_stream(
                 item = await asyncio.wait_for(queue.get(), timeout=heartbeat_sec)
             except asyncio.TimeoutError:
                 elapsed = loop.time() - start_ts
+                heartbeat_text = f'正在生成长文本，请稍候...（已耗时约 {int(elapsed)} 秒）'
                 yield _stream_frame(
-                    think='LCLM workflow in progress',
-                    text=f'正在生成长文本，请稍候...（已耗时约 {int(elapsed)} 秒）',
-                    extra={'finish_reason': 'FINISH_REASON_UNSPECIFIED'},
+                    think=heartbeat_text,
+                    text='',
+                    extra={
+                        'event': 'progress',
+                        'lclm_progress': {'stage': 'heartbeat', 'text': heartbeat_text, 'elapsed_sec': int(elapsed)},
+                        'finish_reason': 'FINISH_REASON_UNSPECIFIED',
+                    },
                 )
                 continue
             if not isinstance(item, dict):
@@ -611,12 +620,15 @@ async def _lclm_forward_stream(
             event = item.get('payload')
             if not isinstance(event, dict):
                 continue
+            if str(event.get('stage') or '').strip().lower() == 'start':
+                continue
             elapsed = loop.time() - start_ts
             progress_text = _lclm_progress_text(event, elapsed)
             yield _stream_frame(
-                think='LCLM workflow in progress',
-                text=_safe_text_chunk(progress_text, '正在生成长文本，请稍候...'),
+                think=_safe_text_chunk(progress_text, '正在生成长文本，请稍候...'),
+                text='',
                 extra={
+                    'event': 'progress',
                     'lclm_progress': event,
                     'finish_reason': 'FINISH_REASON_UNSPECIFIED',
                 },
@@ -638,7 +650,10 @@ async def _lclm_forward_stream(
             if isinstance(lclm_meta, dict):
                 title = str(lclm_meta.get('title') or '').strip()
             download_link = str(output.get('download_link') or output.get('download_url') or '').strip()
-            lines = ['已生成长文本报告。']
+            output_type = ''
+            if isinstance(lclm_meta, dict):
+                output_type = str(lclm_meta.get('output_type') or lclm_meta.get('genre') or '').strip().lower()
+            lines = ['已生成长文本小说。' if output_type in {'story', 'fiction', 'short_story', 'novel'} else '已生成长文本报告。']
             if title:
                 lines.append(f'标题：{title}')
             if download_link:

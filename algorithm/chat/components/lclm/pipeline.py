@@ -10,7 +10,7 @@ from chat.components.lclm.critic import SectionCritic, validate_document_markdow
 from chat.components.lclm.evidence import EvidenceCollector
 from chat.components.lclm.formatter import LongFormFormatter
 from chat.components.lclm.planner import LCLMPlanner
-from chat.components.lclm.schemas import EvidenceCard, LongFormDocumentState
+from chat.components.lclm.schemas import EvidenceCard, LongFormDocumentState, is_story_task
 from chat.components.lclm.writer import SectionWriter
 
 ProgressCallback = Callable[[Dict[str, Any]], None]
@@ -136,29 +136,41 @@ class OutlineLongFormPipeline:
         total_nodes = max(1, len(state.outline))
 
         for index, node in enumerate(state.outline, start=1):
-            _log_info(f'[LCLM] evidence start node_id={node.node_id}')
-            self._emit_progress(
-                'evidence_start',
-                f'正在检索第 {index}/{total_nodes} 节证据...',
-                node_id=node.node_id,
-                index=index,
-                total_nodes=total_nodes,
-            )
-            node.status = 'retrieving'
-            cards, evidence_warnings = self.collector.collect(
-                task=state.task,
-                node=node,
-                runtime_params=self.runtime_params,
-            )
-            _log_info(f'[LCLM] evidence end node_id={node.node_id} card_count={len(cards)}')
-            self._emit_progress(
-                'evidence_end',
-                f'第 {index}/{total_nodes} 节证据检索完成（{len(cards)} 条）。',
-                node_id=node.node_id,
-                index=index,
-                total_nodes=total_nodes,
-                card_count=len(cards),
-            )
+            if is_story_task(state.task) and not state.task.evidence_required:
+                _log_info(f'[LCLM] evidence skipped reason=story_no_evidence node_id={node.node_id}')
+                self._emit_progress(
+                    'story_scene_start',
+                    f'正在准备第 {index}/{total_nodes} 个小说场景...',
+                    node_id=node.node_id,
+                    index=index,
+                    total_nodes=total_nodes,
+                )
+                node.status = 'drafting'
+                cards, evidence_warnings = [], []
+            else:
+                _log_info(f'[LCLM] evidence start node_id={node.node_id}')
+                self._emit_progress(
+                    'evidence_start',
+                    f'正在检索第 {index}/{total_nodes} 节证据...',
+                    node_id=node.node_id,
+                    index=index,
+                    total_nodes=total_nodes,
+                )
+                node.status = 'retrieving'
+                cards, evidence_warnings = self.collector.collect(
+                    task=state.task,
+                    node=node,
+                    runtime_params=self.runtime_params,
+                )
+                _log_info(f'[LCLM] evidence end node_id={node.node_id} card_count={len(cards)}')
+                self._emit_progress(
+                    'evidence_end',
+                    f'第 {index}/{total_nodes} 节证据检索完成（{len(cards)} 条）。',
+                    node_id=node.node_id,
+                    index=index,
+                    total_nodes=total_nodes,
+                    card_count=len(cards),
+                )
             node.evidence_cards = cards
             state.warnings.extend(evidence_warnings)
             state.citation_map = _collect_citations(cards, state.citation_map)
@@ -178,6 +190,7 @@ class OutlineLongFormPipeline:
                 evidence_cards=cards,
                 previous_section_summary=previous_summary,
                 global_terms=state.global_terms,
+                runtime_params=self.runtime_params,
             )
             critique = self.critic.evaluate(
                 section_text=draft_result.section_markdown,
@@ -195,6 +208,7 @@ class OutlineLongFormPipeline:
                     evidence_cards=cards,
                     previous_section_summary=previous_summary,
                     global_terms=state.global_terms,
+                    runtime_params=self.runtime_params,
                     repair_instructions=critique.get('repair_instructions') or [],
                 )
                 repaired_critique = self.critic.evaluate(
@@ -244,7 +258,7 @@ class OutlineLongFormPipeline:
             runtime_params=self.runtime_params,
         )
         doc_check = validate_document_markdown(markdown)
-        if not doc_check.get('passed'):
+        if not is_story_task(state.task) and not doc_check.get('passed'):
             state.warnings.extend(doc_check.get('issues') or [])
         return markdown
 
@@ -262,8 +276,10 @@ class OutlineLongFormPipeline:
                 }
                 for node in state.outline
             ],
-            'warnings': state.warnings[:20],
+            'warnings': [] if is_story_task(state.task) else state.warnings[:20],
             'citation_count': len(state.citation_map),
+            'genre': state.task.genre,
+            'output_type': state.task.output_type,
         }
         output_content = self.formatter.render_output(state.final_markdown, state.task.output_format)
         return save_longform_artifact(
@@ -286,6 +302,10 @@ class OutlineLongFormPipeline:
         _log_info('[LCLM] planning start')
         self._emit_progress('planning_start', '正在规划大纲...')
         task, title, outline, planning_warnings = self.planner.plan(query, self.runtime_params)
+        if is_story_task(task) and not task.evidence_required:
+            self.runtime_params['lclm_enable_evidence'] = False
+            self.runtime_params['lclm_enable_arxiv'] = False
+            self.runtime_params['lclm_enable_web'] = False
         _log_info(f'[LCLM] planning end outline_nodes={len(outline)}')
         self._emit_progress(
             'planning_end',
@@ -326,7 +346,8 @@ class OutlineLongFormPipeline:
         else:
             _log_info('[LCLM] artifact saved')
             self._emit_progress('artifact_saved', '文件已生成。')
-        final_lines = ['已生成长文本报告。', '', f'标题：{title}', f'字数：约 {len(state.final_markdown)} 字']
+        result_kind = '长文本小说' if is_story_task(state.task) else '长文本报告'
+        final_lines = [f'已生成{result_kind}。', '', f'标题：{title}', f'字数：约 {len(state.final_markdown)} 字']
         if download_link:
             final_lines.append(f'下载：[点击下载]({download_link})')
         elif download_url:
@@ -344,12 +365,17 @@ class OutlineLongFormPipeline:
             'download_url': download_url,
             'lclm': {
                 'enabled': True,
+                'genre': state.task.genre,
+                'writing_type': state.task.writing_type,
+                'output_type': state.task.output_type,
+                'citation_required': state.task.citation_required,
+                'evidence_required': state.task.evidence_required,
                 'outline_nodes': len(state.outline),
                 'warning_count': len(state.warnings),
                 'citation_count': len(state.citation_map),
             },
         }
-        if state.warnings:
+        if state.warnings and not is_story_task(state.task):
             response['lclm']['warnings'] = state.warnings[:20]
         total_cost = round(time.time() - start_ts, 3)
         _log_info(f'[LCLM] done total_cost={total_cost}')
